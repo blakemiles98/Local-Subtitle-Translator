@@ -1,48 +1,49 @@
 from __future__ import annotations
 
-import whisper
+from faster_whisper import WhisperModel
 import srt
 from datetime import timedelta
 
 def _td(seconds: float) -> timedelta:
     return timedelta(seconds=float(seconds))
 
-def detect_language_with_probs(model, video_path: str) -> tuple[str, dict[str, float]]:
-    """
-    Uses Whisper's language detection to return:
-      (top_language_code, {lang_code: prob})
-    """
-    audio = whisper.load_audio(video_path)
-    audio = whisper.pad_or_trim(audio)
-
-    mel = whisper.log_mel_spectrogram(audio).to(model.device)
-    _, probs = model.detect_language(mel)
-
-    top_lang = max(probs, key=probs.get)
-    return top_lang, probs
-
-def transcribe_to_srt(video_path: str, model_name: str = "medium") -> tuple[str, dict[str, float], str]:
+def transcribe_to_srt(
+    video_path: str,
+    model_name: str = "medium",
+    whisper_cache: dict | None = None,
+) -> tuple[str, dict[str, float], str]:
     """
     Returns (detected_language, lang_probs, srt_text)
-    detected_language is a whisper lang code like 'en', 'ja', 'es'
+
+    Uses a cache so we don't reload the Whisper model for every file.
+    faster-whisper provides language + probability.
     """
-    model = whisper.load_model(model_name)
+    if whisper_cache is None:
+        whisper_cache = {}
 
-    detected_language, probs = detect_language_with_probs(model, video_path)
+    # cache key includes model_name + device + compute_type
+    key = (model_name, "cpu", "int8")
 
-    # Hint language for transcription (helps stability/speed)
-    result = model.transcribe(video_path, language=detected_language)
+    model = whisper_cache.get(key)
+    if model is None:
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        whisper_cache[key] = model
 
-    subtitles = []
-    for idx, seg in enumerate(result["segments"], start=1):
-        subtitles.append(
+    # beam_size: 1-2 faster, 5 better
+    segments, info = model.transcribe(video_path, beam_size=1, vad_filter=True)
+
+    detected_lang = info.language or "unknown"
+    probs = {detected_lang: float(info.language_probability or 0.0)}
+
+    subs = []
+    for idx, seg in enumerate(segments, start=1):
+        subs.append(
             srt.Subtitle(
                 index=idx,
-                start=_td(seg["start"]),
-                end=_td(seg["end"]),
-                content=seg["text"].strip(),
+                start=_td(seg.start),
+                end=_td(seg.end),
+                content=seg.text.strip(),
             )
         )
 
-    srt_text = srt.compose(subtitles)
-    return detected_language, probs, srt_text
+    return detected_lang, probs, srt.compose(subs)

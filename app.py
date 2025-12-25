@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import threading
 import queue
 from dataclasses import dataclass
@@ -19,7 +20,6 @@ EN_PROB_STRONG = 0.70
 EN_PROB_SOFT = 0.55
 TOP_GAP_SOFT = 0.15
 
-
 @dataclass
 class UiEvent:
     kind: str                 # "status", "progress", "done", "error"
@@ -28,7 +28,7 @@ class UiEvent:
     current: int = 0
     total: int = 0
     summary: str = ""
-
+    elapsed_s: float = 0.0
 
 def is_effectively_english(detected_lang: str, probs: dict[str, float]) -> tuple[bool, str]:
     if detected_lang == "en":
@@ -46,7 +46,6 @@ def is_effectively_english(detected_lang: str, probs: dict[str, float]) -> tuple
 
     return False, f"Non-English likely (top={top_lang}:{top_prob:.2f}, en={en_prob:.2f})."
 
-
 def collect_videos(folder: Path, recursive: bool) -> list[Path]:
     if recursive:
         vids = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
@@ -54,48 +53,64 @@ def collect_videos(folder: Path, recursive: bool) -> list[Path]:
         vids = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
     return sorted(vids)
 
-
-def process_one_video(video_path: Path, uiq: queue.Queue, cancel_flag: threading.Event) -> tuple[bool, str]:
+def process_one_video(video_path: Path, uiq: queue.Queue, cancel_flag: threading.Event, translator_cache: dict, whisper_cache: dict) -> tuple[bool, str]:
     out_dir = video_path.parent
     base_name = video_path.stem
 
     final_srt_path = out_dir / f"{base_name}.srt"
-    temp_source_srt_path = out_dir / f"{base_name}.source.srt"
+    fallback_source_srt_path = out_dir / f"{base_name}.source.srt"
 
     if cancel_flag.is_set():
         return False, f"{video_path.name}: cancelled"
 
     uiq.put(UiEvent(kind="status", status="Whisper", detail=f"Transcribing: {video_path.name}"))
-    detected_lang, probs, source_srt = transcribe_to_srt(str(video_path), model_name=WHISPER_MODEL)
-    temp_source_srt_path.write_text(source_srt, encoding="utf-8")
+    detected_lang, probs, source_srt = transcribe_to_srt(str(video_path), model_name=WHISPER_MODEL, whisper_cache=whisper_cache)
 
+    # Decide if we should treat as English
     treat_as_en, reason = is_effectively_english(detected_lang, probs)
+
     if treat_as_en:
-        uiq.put(UiEvent(kind="status", status="Finalize", detail=f"Keeping English: {video_path.name}\n({reason})"))
+        uiq.put(UiEvent(kind="status", status="Finalize", detail=f"Writing English SRT: {video_path.name}\n({reason})"))
         final_srt_path.write_text(source_srt, encoding="utf-8")
-        temp_source_srt_path.unlink(missing_ok=True)
         return True, f"{video_path.name}: English SRT written ({reason})"
 
+    # Translate (only if we have mapping)
     src_nllb = WHISPER_TO_NLLB.get(detected_lang)
     if not src_nllb:
+        # Can't translate → write source as fallback
+        fallback_source_srt_path.write_text(source_srt, encoding="utf-8")
         uiq.put(UiEvent(
             kind="status",
-            status="Skipped translation",
-            detail=f"{video_path.name}\nDetected '{detected_lang}' but no NLLB mapping.\nKept: {temp_source_srt_path.name}"
+            status="Translation skipped",
+            detail=f"{video_path.name}\nDetected '{detected_lang}' but no NLLB mapping.\nKept source: {fallback_source_srt_path.name}"
         ))
-        return False, f"{video_path.name}: no NLLB mapping for '{detected_lang}' (kept source)."
+        return False, f"{video_path.name}: no NLLB mapping for '{detected_lang}' (wrote source fallback)."
 
     if cancel_flag.is_set():
         return False, f"{video_path.name}: cancelled"
 
-    uiq.put(UiEvent(kind="status", status="Translate", detail=f"Translating: {video_path.name}\n(detected {detected_lang})"))
-    translator = NllbTranslator(src_lang=src_nllb, tgt_lang="eng_Latn", device="cpu")
-    english_srt = translator.translate_srt(source_srt, batch_size=12)
+    try:
+        uiq.put(UiEvent(kind="status", status="Translate", detail=f"Translating: {video_path.name}\n(detected {detected_lang})"))
+        translator = translator_cache.get(src_nllb)
+        if translator is None:
+            uiq.put(UiEvent(kind="status", status="Translate", detail=f"Loading translator model: {src_nllb}"))
+            translator = NllbTranslator(src_lang=src_nllb, tgt_lang="eng_Latn", device="cpu")
+            translator_cache[src_nllb] = translator
 
-    uiq.put(UiEvent(kind="status", status="Finalize", detail=f"Writing English SRT: {video_path.name}"))
-    final_srt_path.write_text(english_srt, encoding="utf-8")
-    temp_source_srt_path.unlink(missing_ok=True)
-    return True, f"{video_path.name}: translated to English ({final_srt_path.name})"
+        english_srt = translator.translate_srt(source_srt, batch_size=24)
+
+        uiq.put(UiEvent(kind="status", status="Finalize", detail=f"Writing English SRT: {video_path.name}"))
+        final_srt_path.write_text(english_srt, encoding="utf-8")
+
+        # Optionally: if an old fallback source exists from a previous run, delete it
+        fallback_source_srt_path.unlink(missing_ok=True)
+
+        return True, f"{video_path.name}: translated to English ({final_srt_path.name})"
+    except Exception as e:
+        # Translation failed → write source as fallback so user still gets something
+        fallback_source_srt_path.write_text(source_srt, encoding="utf-8")
+        return False, f"{video_path.name}: translation failed ({e}). Wrote source fallback."
+
 
 
 class App(tk.Tk):
@@ -139,20 +154,58 @@ class App(tk.Tk):
         def worker():
             results = []
             total = len(videos)
+            batch_start = time.perf_counter()
+            translator_cache = {}
+            whisper_cache = {}
             try:
+                completed = 0
+
                 for idx, vid in enumerate(videos, start=1):
                     if self.cancel_flag.is_set():
                         results.append("Cancelled by user.")
                         break
 
-                    self.uiq.put(UiEvent(kind="progress", current=idx, total=total))
-                    self.uiq.put(UiEvent(kind="status", status="Processing", detail=f"{vid.name}"))
+                    elapsed = time.perf_counter() - batch_start
 
-                    ok, msg = process_one_video(vid, self.uiq, self.cancel_flag)
-                    results.append(("OK: " if ok else "WARN: ") + msg)
+                    # 0/1 while working
+                    self.uiq.put(UiEvent(
+                        kind="progress",
+                        current=completed,
+                        total=total,
+                        elapsed_s=elapsed
+                    ))
+                    self.uiq.put(UiEvent(
+                        kind="status",
+                        status="Processing",
+                        detail=f"{vid.name}"
+                    ))
+
+                    # OPTIONAL: per-file timing
+                    file_start = time.perf_counter()
+
+                    ok, msg = process_one_video(
+                        vid, self.uiq, self.cancel_flag, translator_cache, whisper_cache
+                    )
+
+                    file_elapsed = time.perf_counter() - file_start
+
+                    # OPTIONAL: include per-file time in summary
+                    results.append(f"{'OK' if ok else 'WARN'} ({file_elapsed:.1f}s): {msg}")
+
+                    # Mark completed AFTER finishing the file
+                    completed += 1
+                    elapsed = time.perf_counter() - batch_start
+
+                    self.uiq.put(UiEvent(
+                        kind="progress",
+                        current=completed,
+                        total=total,
+                        elapsed_s=elapsed
+                    ))
 
                 summary = "\n".join(results[-25:])
-                self.uiq.put(UiEvent(kind="done", summary=summary))
+                elapsed = time.perf_counter() - batch_start  # 2C
+                self.uiq.put(UiEvent(kind="done", summary=summary, elapsed_s=elapsed))
             except Exception as e:
                 self.uiq.put(UiEvent(kind="error", summary=str(e)))
 
@@ -166,10 +219,16 @@ class App(tk.Tk):
                 if ev.kind == "status":
                     self.frames["ProgressFrame"].set_status(ev.status, ev.detail)
                 elif ev.kind == "progress":
-                    self.frames["ProgressFrame"].set_progress(ev.current, ev.total)
+                    self.frames["ProgressFrame"].set_progress(ev.current, ev.total, ev.elapsed_s)
                 elif ev.kind == "done":
                     self.frames["ProgressFrame"].set_status("Done", "Finished.")
-                    messagebox.showinfo("Summary", ev.summary or "Done.")
+                    secs = int(ev.elapsed_s)
+                    h = secs // 3600
+                    m = (secs % 3600) // 60
+                    s = secs % 60
+                    elapsed_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+                    messagebox.showinfo("Summary", f"Total time: {elapsed_str}\n\n{ev.summary or 'Done.'}")
                     self.show_frame("SetupFrame")
                 elif ev.kind == "error":
                     messagebox.showerror("Error", ev.summary or "Unknown error")
@@ -257,6 +316,9 @@ class ProgressFrame(ttk.Frame):
         self.cancel_btn = ttk.Button(btns, text="Cancel", command=self.on_cancel)
         self.cancel_btn.pack(side="right")
 
+        self.time_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.time_var).pack(anchor="w", pady=(6, 0))
+
     def on_show(self):
         self.set_status("Starting…", "")
         self.set_progress(0, 1)
@@ -267,10 +329,22 @@ class ProgressFrame(ttk.Frame):
         self.bar["value"] = 0
         self.count_var.set(f"0 / {total}")
 
-    def set_progress(self, current: int, total: int):
+    def set_progress(self, current: int, total: int, elapsed_s: float = 0.0):
         self.bar["maximum"] = max(total, 1)
-        self.bar["value"] = max(current - 1, 0)  # show completed items
+        self.bar["value"] = current
         self.count_var.set(f"{current} / {total}")
+
+        # format elapsed nicely
+        secs = int(elapsed_s)
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        s = secs % 60
+        if h:
+            self.time_var.set(f"Elapsed: {h}:{m:02d}:{s:02d}")
+        else:
+            self.time_var.set(f"Elapsed: {m}:{s:02d}")
+
+
 
     def set_status(self, status: str, detail: str):
         self.status_var.set(status)
