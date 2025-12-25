@@ -1,0 +1,7 @@
+openai-whisper
+torch
+transformers
+sentencepiece
+accelerate
+srt
+ffmpeg-python
