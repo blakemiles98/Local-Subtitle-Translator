@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import threading
 import queue
+import json
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
@@ -20,6 +21,39 @@ EN_PROB_STRONG = 0.70
 EN_PROB_SOFT = 0.55
 TOP_GAP_SOFT = 0.15
 
+SETTINGS_FILE = Path("settings.json")
+
+DEFAULT_SETTINGS = {
+    "mode": "single",
+    "scan_subfolders": True,
+    "existing_srt_mode": "skip",
+}
+
+def load_settings() -> dict:
+    if not SETTINGS_FILE.exists():
+        return DEFAULT_SETTINGS.copy()
+
+    try:
+        with SETTINGS_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        # Corrupt or unreadable → fall back safely
+        return DEFAULT_SETTINGS.copy()
+
+    # Merge with defaults so missing keys don’t break anything
+    settings = DEFAULT_SETTINGS.copy()
+    settings.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
+    return settings
+
+
+def save_settings(settings: dict) -> None:
+    try:
+        with SETTINGS_FILE.open("w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception:
+        # Non-fatal; ignore write errors
+        pass
+
 @dataclass
 class UiEvent:
     kind: str                 # "status", "progress", "done", "error"
@@ -29,6 +63,7 @@ class UiEvent:
     total: int = 0
     summary: str = ""
     elapsed_s: float = 0.0
+
 
 def is_effectively_english(detected_lang: str, probs: dict[str, float]) -> tuple[bool, str]:
     if detected_lang == "en":
@@ -46,6 +81,18 @@ def is_effectively_english(detected_lang: str, probs: dict[str, float]) -> tuple
 
     return False, f"Non-English likely (top={top_lang}:{top_prob:.2f}, en={en_prob:.2f})."
 
+
+def has_real_text(srt_text: str) -> bool:
+    """
+    Returns True if there is at least one alphanumeric character
+    in the subtitle contents.
+    """
+    for ch in srt_text:
+        if ch.isalnum():
+            return True
+    return False
+
+
 def collect_videos(folder: Path, recursive: bool) -> list[Path]:
     if recursive:
         vids = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
@@ -53,18 +100,40 @@ def collect_videos(folder: Path, recursive: bool) -> list[Path]:
         vids = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
     return sorted(vids)
 
-def process_one_video(video_path: Path, uiq: queue.Queue, cancel_flag: threading.Event, translator_cache: dict, whisper_cache: dict) -> tuple[bool, str]:
+def process_one_video(video_path: Path, uiq: queue.Queue, cancel_flag: threading.Event, translator_cache: dict, whisper_cache: dict, existing_srt_mode: str) -> tuple[bool, str]:
     out_dir = video_path.parent
     base_name = video_path.stem
 
     final_srt_path = out_dir / f"{base_name}.srt"
     fallback_source_srt_path = out_dir / f"{base_name}.source.srt"
 
+    if final_srt_path.exists():
+        if existing_srt_mode == "skip":
+            uiq.put(UiEvent(
+                kind="status",
+                status="Skipped",
+                detail=f"Existing SRT found, skipping: {video_path.name}"
+            ))
+            return True, f"{video_path.name}: skipped (existing {final_srt_path.name})"
+
+        if existing_srt_mode == "overwrite":
+            fallback_source_srt_path.unlink(missing_ok=True)
+
     if cancel_flag.is_set():
         return False, f"{video_path.name}: cancelled"
 
     uiq.put(UiEvent(kind="status", status="Whisper", detail=f"Transcribing: {video_path.name}"))
     detected_lang, probs, source_srt = transcribe_to_srt(str(video_path), model_name=WHISPER_MODEL, whisper_cache=whisper_cache)
+
+    # If Whisper produced no real text, do nothing
+    if not has_real_text(source_srt):
+        uiq.put(UiEvent(
+            kind="status",
+            status="Skipped",
+            detail=f"No speech detected: {video_path.name}"
+        ))
+        return False, f"{video_path.name}: no speech detected (no SRT created)"
+
 
     # Decide if we should treat as English
     treat_as_en, reason = is_effectively_english(detected_lang, probs)
@@ -124,6 +193,8 @@ class App(tk.Tk):
         self.cancel_flag = threading.Event()
         self.worker_thread: threading.Thread | None = None
 
+        self.settings = load_settings()
+
         self.container = ttk.Frame(self, padding=14)
         self.container.pack(fill="both", expand=True)
 
@@ -142,7 +213,7 @@ class App(tk.Tk):
         frame.tkraise()
         frame.on_show()
 
-    def start_work(self, videos: list[Path]):
+    def start_work(self, videos: list[Path], existing_srt_mode: str):
         if not videos:
             messagebox.showwarning("No videos", "No videos selected.")
             return
@@ -184,13 +255,16 @@ class App(tk.Tk):
                     file_start = time.perf_counter()
 
                     ok, msg = process_one_video(
-                        vid, self.uiq, self.cancel_flag, translator_cache, whisper_cache
+                        vid, self.uiq, self.cancel_flag, translator_cache, whisper_cache, existing_srt_mode
                     )
 
                     file_elapsed = time.perf_counter() - file_start
 
                     # OPTIONAL: include per-file time in summary
-                    results.append(f"{'OK' if ok else 'WARN'} ({file_elapsed:.1f}s): {msg}")
+                    tag = "OK" if ok else "WARN"
+                    if "skipped" in msg.lower():
+                        tag = "SKIP"
+                    results.append(f"{tag} ({file_elapsed:.1f}s): {msg}")
 
                     # Mark completed AFTER finishing the file
                     completed += 1
@@ -243,8 +317,11 @@ class SetupFrame(ttk.Frame):
         super().__init__(parent)
         self.controller = controller
 
-        self.mode = tk.StringVar(value="single")
-        self.scan_subfolders = tk.BooleanVar(value=True)
+        settings = controller.settings
+
+        self.mode = tk.StringVar(value=settings.get("mode", "single"))
+        self.scan_subfolders = tk.BooleanVar(value=settings.get("scan_subfolders", True))
+        self.existing_srt_mode = tk.StringVar(value=settings.get("existing_srt_mode", "skip"))
 
         ttk.Label(self, text="Subtitle Generator + Translator", font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(self, text="Generates subtitles with Whisper. If not English, translates to English using NLLB-200.").pack(anchor="w", pady=(6, 12))
@@ -257,6 +334,23 @@ class SetupFrame(ttk.Frame):
 
         self.sub_chk = ttk.Checkbutton(box, text="Scan subfolders (batch only)", variable=self.scan_subfolders)
         self.sub_chk.pack(anchor="w", pady=(6, 0))
+
+        opts = ttk.LabelFrame(self, text="Existing .srt behavior", padding=10)
+        opts.pack(fill="x", pady=(10, 0))
+
+        ttk.Radiobutton(
+            opts,
+            text="Skip videos that already have a .srt",
+            variable=self.existing_srt_mode,
+            value="skip",
+        ).pack(anchor="w")
+
+        ttk.Radiobutton(
+            opts,
+            text="Overwrite existing .srt files",
+            variable=self.existing_srt_mode,
+            value="overwrite",
+        ).pack(anchor="w")
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(16, 0))
@@ -271,6 +365,14 @@ class SetupFrame(ttk.Frame):
         pass
 
     def on_start(self):
+        # Save current settings
+        self.controller.settings = {
+            "mode": self.mode.get(),
+            "scan_subfolders": self.scan_subfolders.get(),
+            "existing_srt_mode": self.existing_srt_mode.get(),
+        }
+        save_settings(self.controller.settings)
+        
         mode = self.mode.get()
 
         if mode == "single":
@@ -280,7 +382,7 @@ class SetupFrame(ttk.Frame):
             )
             if not path:
                 return
-            self.controller.start_work([Path(path)])
+            self.controller.start_work([Path(path)], existing_srt_mode=self.existing_srt_mode.get())
             return
 
         # batch
@@ -291,7 +393,7 @@ class SetupFrame(ttk.Frame):
         if not vids:
             messagebox.showwarning("No videos found", "No videos found with the chosen options.")
             return
-        self.controller.start_work(vids)
+        self.controller.start_work(vids, existing_srt_mode=self.existing_srt_mode.get())
 
 
 class ProgressFrame(ttk.Frame):

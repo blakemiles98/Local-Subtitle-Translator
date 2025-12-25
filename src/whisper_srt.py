@@ -30,7 +30,7 @@ def transcribe_to_srt(
         whisper_cache[key] = model
 
     # beam_size: 1-2 faster, 5 better
-    segments, info = model.transcribe(video_path, beam_size=1, vad_filter=True)
+    segments, info = model.transcribe(video_path, beam_size=2, vad_filter=True)
 
     detected_lang = info.language or "unknown"
     probs = {detected_lang: float(info.language_probability or 0.0)}
@@ -45,5 +45,8 @@ def transcribe_to_srt(
                 content=seg.text.strip(),
             )
         )
+
+    if not subs:
+        return detected_lang, probs, ""
 
     return detected_lang, probs, srt.compose(subs)

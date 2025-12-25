@@ -49,3 +49,5 @@ pip-cache/
 
 # Optional: ignore final subtitles if you don't want them committed
 # *.srt
+
+settings.json

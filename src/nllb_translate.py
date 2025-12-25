@@ -30,7 +30,7 @@ class NllbTranslator:
             **inputs,
             forced_bos_token_id=forced_bos_token_id,
             max_new_tokens=max_new_tokens,
-            num_beams=1,
+            num_beams=2,
         )
         return self.tokenizer.batch_decode(output, skip_special_tokens=True)[0].strip()
 
