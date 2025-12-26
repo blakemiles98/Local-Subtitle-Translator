@@ -2,7 +2,7 @@ WHISPER_TO_NLLB = {
     "en": "eng_Latn",
     "ja": "jpn_Jpan",
     "ko": "kor_Hang",
-    "zh": "zho_Hans",   # default to Simplified if Whisper says zh
+    "zh": "zho_Hans",
     "es": "spa_Latn",
     "fr": "fra_Latn",
     "de": "deu_Latn",
@@ -25,4 +25,6 @@ WHISPER_TO_NLLB = {
     "th": "tha_Thai",
     "vi": "vie_Latn",
     "id": "ind_Latn",
+    "nn": "nno_Latn",
+    "nb": "nob_Latn",
 }

@@ -28,14 +28,13 @@ class Result:
     video: str
     elapsed_s: float
 
-# A simple callback for progress/status updates
-StatusFn = Callable[[str, str], None]   # (status, detail)
-ProgressFn = Callable[[int, int, float], None]  # (completed, total, elapsed_s)
+StatusFn = Callable[[str, str], None]
+ProgressFn = Callable[[int, int, float], None]
 
 def process_one_video(
     video_path: Path,
     whisper_model: str,
-    existing_srt_mode: str,  # "skip" or "overwrite"
+    existing_srt_mode: str,
     translator_cache: dict,
     whisper_cache: dict,
     status: StatusFn | None = None,
@@ -48,11 +47,9 @@ def process_one_video(
     final_srt_path = out_dir / f"{base_name}.srt"
     fallback_source_srt_path = out_dir / f"{base_name}.source.srt"
 
-    # overwrite mode: clean stale fallback
     if existing_srt_mode == "overwrite":
         fallback_source_srt_path.unlink(missing_ok=True)
 
-    # skip if exists
     if final_srt_path.exists() and existing_srt_mode == "skip":
         if status:
             status("Skipped", f"Existing SRT found, skipping: {video_path.name}")
@@ -71,14 +68,12 @@ def process_one_video(
             status("Skipped", f"No speech detected: {video_path.name}")
         return Result(False, "no speech detected (no SRT created)", video_path.name, time.perf_counter() - t0)
 
-    # English = keep as-is
     if detected_lang == "en":
         if status:
             status("Finalize", f"Writing English SRT: {video_path.name}")
         final_srt_path.write_text(source_srt, encoding="utf-8")
         return Result(True, "english srt written", video_path.name, time.perf_counter() - t0)
 
-    # translate if possible
     src_nllb = WHISPER_TO_NLLB.get(detected_lang)
     if not src_nllb:
         fallback_source_srt_path.write_text(source_srt, encoding="utf-8")
@@ -92,7 +87,7 @@ def process_one_video(
     translator = translator_cache.get(src_nllb)
     if translator is None:
         if status:
-            status("Translate", f"Loading translator: {src_nllb}")
+            status("Translate", f"Initializing language pipeline: {src_nllb}")
         translator = NllbTranslator(src_lang=src_nllb, tgt_lang="eng_Latn", device="cpu")
         translator_cache[src_nllb] = translator
 
@@ -112,9 +107,14 @@ def run_batch(
     recursive: bool = False,
     status: StatusFn | None = None,
     progress: ProgressFn | None = None,
+    translator_cache: dict | None = None,
+    whisper_cache: dict | None = None,
 ) -> list[Result]:
-    translator_cache: dict = {}
-    whisper_cache: dict = {}
+    if translator_cache is None:
+        translator_cache = {}
+    if whisper_cache is None:
+        whisper_cache = {}
+
     results: list[Result] = []
 
     t0 = time.perf_counter()

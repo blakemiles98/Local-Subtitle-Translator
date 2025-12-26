@@ -8,11 +8,13 @@ import srt
 
 MODEL_NAME = "facebook/nllb-200-distilled-600M"
 
-# Often helps CPU perf on Windows by reducing thread contention.
 torch.set_num_threads(max(1, (os.cpu_count() or 4) - 2))
 
+def warmup(device: str = "cpu") -> None:
+    _get_shared(device)
+
 _shared_lock = threading.Lock()
-_shared = {}  # key: (device) -> {"tokenizer": ..., "model": ...}
+_shared = {}
 
 def _get_shared(device: str):
     with _shared_lock:
@@ -48,7 +50,7 @@ class NllbTranslator:
             **inputs,
             forced_bos_token_id=forced_bos_token_id,
             max_new_tokens=max_new_tokens,
-            num_beams=2,  # faster on CPU; change to 2 if you want slightly better quality
+            num_beams=2,
         )
         return self.tokenizer.batch_decode(output, skip_special_tokens=True)[0].strip()
 

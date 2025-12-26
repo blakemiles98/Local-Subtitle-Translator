@@ -11,11 +11,11 @@ from tkinter import ttk, filedialog, messagebox
 
 from src.core import collect_videos, process_one_video
 from src.core import run_batch
+from src.nllb_translate import warmup as nllb_warmup
 
-WHISPER_MODEL = "medium"  # "small" for speed on CPU
+WHISPER_MODEL = "medium"
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
 
-# English skip-translation heuristics:
 EN_PROB_STRONG = 0.70
 EN_PROB_SOFT = 0.55
 TOP_GAP_SOFT = 0.15
@@ -36,10 +36,8 @@ def load_settings() -> dict:
         with SETTINGS_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        # Corrupt or unreadable → fall back safely
         return DEFAULT_SETTINGS.copy()
 
-    # Merge with defaults so missing keys don’t break anything
     settings = DEFAULT_SETTINGS.copy()
     settings.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
     return settings
@@ -49,12 +47,11 @@ def save_settings(settings: dict) -> None:
         with SETTINGS_FILE.open("w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
     except Exception:
-        # Non-fatal; ignore write errors
         pass
 
 @dataclass
 class UiEvent:
-    kind: str                 # "status", "progress", "done", "error"
+    kind: str
     status: str = ""
     detail: str = ""
     current: int = 0
@@ -75,6 +72,9 @@ class App(tk.Tk):
 
         self.settings = load_settings()
 
+        self.translator_cache = {}
+        self.whisper_cache = {}
+
         self.container = ttk.Frame(self, padding=14)
         self.container.pack(fill="both", expand=True)
 
@@ -85,6 +85,8 @@ class App(tk.Tk):
             frame.grid(row=0, column=0, sticky="nsew")
 
         self.show_frame("SetupFrame")
+
+        threading.Thread(target=self._warmup_models, daemon=True).start()
 
         self.after(100, self.poll_ui_events)
 
@@ -121,9 +123,10 @@ class App(tk.Tk):
                     existing_srt_mode=existing_srt_mode,
                     status=status,
                     progress=progress,
+                    translator_cache=self.translator_cache,
+                    whisper_cache=self.whisper_cache,
                 )
 
-                # build summary
                 lines = []
                 for r in results[-25:]:
                     tag = "OK" if r.ok else "WARN"
@@ -133,7 +136,7 @@ class App(tk.Tk):
                     lines.append(f"{tag} ({r.elapsed_s:.1f}s): {r.video}: {r.message}")
 
                 summary = "\n".join(lines)
-                elapsed = sum(r.elapsed_s for r in results)  # or track elapsed in progress already
+                elapsed = sum(r.elapsed_s for r in results)
                 self.uiq.put(UiEvent(kind="done", summary=summary, elapsed_s=(time.perf_counter() - batch_start)))
             except Exception as e:
                 self.uiq.put(UiEvent(kind="error", summary=str(e)))
@@ -147,6 +150,8 @@ class App(tk.Tk):
                 ev: UiEvent = self.uiq.get_nowait()
                 if ev.kind == "status":
                     self.frames["ProgressFrame"].set_status(ev.status, ev.detail)
+                    if "SetupFrame" in self.frames:
+                        self.frames["SetupFrame"].set_status(ev.status, ev.detail)
                 elif ev.kind == "progress":
                     self.frames["ProgressFrame"].set_progress(ev.current, ev.total, ev.elapsed_s)
                 elif ev.kind == "done":
@@ -165,6 +170,19 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self.poll_ui_events)
+    
+    def _warmup_models(self):
+        try:
+            t0 = time.perf_counter()
+            self.uiq.put(UiEvent(kind="status", status="Warmup", detail="Loading translation model..."))
+
+            from src.nllb_translate import warmup as nllb_warmup
+            nllb_warmup(device="cpu")
+
+            dt = time.perf_counter() - t0
+            self.uiq.put(UiEvent(kind="status", status="Warmup", detail=f"Translation model loaded ({dt:.1f}s)."))
+        except Exception as e:
+            self.uiq.put(UiEvent(kind="status", status="Warmup", detail=f"Warmup failed: {e}"))
 
 class SetupFrame(ttk.Frame):
     def __init__(self, parent, controller: App):
@@ -172,6 +190,9 @@ class SetupFrame(ttk.Frame):
         self.controller = controller
 
         settings = controller.settings
+
+        self.setup_status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.setup_status_var, wraplength=600).pack(anchor="w", pady=(10, 0))
 
         self.mode = tk.StringVar(value=settings.get("mode", "single"))
         self.scan_subfolders = tk.BooleanVar(value=settings.get("scan_subfolders", True))
@@ -215,11 +236,13 @@ class SetupFrame(ttk.Frame):
         self.hint = ttk.Label(self, text=f"Whisper model: {WHISPER_MODEL} (edit in app.py)")
         self.hint.pack(anchor="w", pady=(14, 0))
 
+    def set_status(self, status: str, detail: str):
+        self.setup_status_var.set(f"{status}: {detail}".strip())
+
     def on_show(self):
         pass
 
     def on_start(self):
-        # Save current settings
         self.controller.settings = {
             "mode": self.mode.get(),
             "scan_subfolders": self.scan_subfolders.get(),
@@ -239,7 +262,6 @@ class SetupFrame(ttk.Frame):
             self.controller.start_work([Path(path)], existing_srt_mode=self.existing_srt_mode.get())
             return
 
-        # batch
         folder = filedialog.askdirectory(title="Select a folder of videos")
         if not folder:
             return
@@ -289,7 +311,6 @@ class ProgressFrame(ttk.Frame):
         self.bar["value"] = current
         self.count_var.set(f"{current} / {total}")
 
-        # format elapsed nicely
         secs = int(elapsed_s)
         h = secs // 3600
         m = (secs % 3600) // 60
