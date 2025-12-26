@@ -9,9 +9,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from src.whisper_srt import transcribe_to_srt
-from src.nllb_translate import NllbTranslator
-from src.lang_map import WHISPER_TO_NLLB
+from src.core import collect_videos, process_one_video
+from src.core import run_batch
 
 WHISPER_MODEL = "medium"  # "small" for speed on CPU
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
@@ -45,7 +44,6 @@ def load_settings() -> dict:
     settings.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
     return settings
 
-
 def save_settings(settings: dict) -> None:
     try:
         with SETTINGS_FILE.open("w", encoding="utf-8") as f:
@@ -63,108 +61,6 @@ class UiEvent:
     total: int = 0
     summary: str = ""
     elapsed_s: float = 0.0
-
-
-def is_effectively_english(detected_lang: str, probs: dict[str, float]) -> tuple[bool, str]:
-    if detected_lang == "en":
-        return True, "Detected language is English."
-    return False, f"Detected language is {detected_lang}."
-
-
-def has_real_text(srt_text: str) -> bool:
-    """
-    Returns True if there is at least one alphanumeric character
-    in the subtitle contents.
-    """
-    for ch in srt_text:
-        if ch.isalnum():
-            return True
-    return False
-
-
-def collect_videos(folder: Path, recursive: bool) -> list[Path]:
-    if recursive:
-        vids = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
-    else:
-        vids = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
-    return sorted(vids)
-
-def process_one_video(video_path: Path, uiq: queue.Queue, cancel_flag: threading.Event, translator_cache: dict, whisper_cache: dict, existing_srt_mode: str) -> tuple[bool, str]:
-    out_dir = video_path.parent
-    base_name = video_path.stem
-
-    final_srt_path = out_dir / f"{base_name}.srt"
-    fallback_source_srt_path = out_dir / f"{base_name}.source.srt"
-
-    if existing_srt_mode == "overwrite":
-        fallback_source_srt_path.unlink(missing_ok=True)
-
-    if final_srt_path.exists() and existing_srt_mode == "skip":
-        uiq.put(UiEvent(kind="status", status="Skipped", detail=f"Existing SRT found, skipping: {video_path.name}"))
-        return True, f"{video_path.name}: skipped (existing {final_srt_path.name})"
-
-    if cancel_flag.is_set():
-        return False, f"{video_path.name}: cancelled"
-
-    uiq.put(UiEvent(kind="status", status="Whisper", detail=f"Transcribing: {video_path.name}"))
-    detected_lang, probs, source_srt = transcribe_to_srt(str(video_path), model_name=WHISPER_MODEL, whisper_cache=whisper_cache)
-
-    # If Whisper produced no real text, do nothing
-    if not has_real_text(source_srt):
-        uiq.put(UiEvent(
-            kind="status",
-            status="Skipped",
-            detail=f"No speech detected: {video_path.name}"
-        ))
-        return False, f"{video_path.name}: no speech detected (no SRT created)"
-
-
-    # Decide if we should treat as English
-    treat_as_en, reason = is_effectively_english(detected_lang, probs)
-
-    if treat_as_en:
-        uiq.put(UiEvent(kind="status", status="Finalize", detail=f"Writing English SRT: {video_path.name}\n({reason})"))
-        final_srt_path.write_text(source_srt, encoding="utf-8")
-        return True, f"{video_path.name}: English SRT written ({reason})"
-
-    # Translate (only if we have mapping)
-    src_nllb = WHISPER_TO_NLLB.get(detected_lang)
-    if not src_nllb:
-        # Can't translate → write source as fallback
-        fallback_source_srt_path.write_text(source_srt, encoding="utf-8")
-        uiq.put(UiEvent(
-            kind="status",
-            status="Translation skipped",
-            detail=f"{video_path.name}\nDetected '{detected_lang}' but no NLLB mapping.\nKept source: {fallback_source_srt_path.name}"
-        ))
-        return False, f"{video_path.name}: no NLLB mapping for '{detected_lang}' (wrote source fallback)."
-
-    if cancel_flag.is_set():
-        return False, f"{video_path.name}: cancelled"
-
-    try:
-        uiq.put(UiEvent(kind="status", status="Translate", detail=f"Translating: {video_path.name}\n(detected {detected_lang})"))
-        translator = translator_cache.get(src_nllb)
-        if translator is None:
-            uiq.put(UiEvent(kind="status", status="Translate", detail=f"Loading translator model: {src_nllb}"))
-            translator = NllbTranslator(src_lang=src_nllb, tgt_lang="eng_Latn", device="cpu")
-            translator_cache[src_nllb] = translator
-
-        english_srt = translator.translate_srt(source_srt, batch_size=24)
-
-        uiq.put(UiEvent(kind="status", status="Finalize", detail=f"Writing English SRT: {video_path.name}"))
-        final_srt_path.write_text(english_srt, encoding="utf-8")
-
-        # Optionally: if an old fallback source exists from a previous run, delete it
-        fallback_source_srt_path.unlink(missing_ok=True)
-
-        return True, f"{video_path.name}: translated to English ({final_srt_path.name})"
-    except Exception as e:
-        # Translation failed → write source as fallback so user still gets something
-        fallback_source_srt_path.write_text(source_srt, encoding="utf-8")
-        return False, f"{video_path.name}: translation failed ({e}). Wrote source fallback."
-
-
 
 class App(tk.Tk):
     def __init__(self):
@@ -213,58 +109,32 @@ class App(tk.Tk):
             translator_cache = {}
             whisper_cache = {}
             try:
-                completed = 0
+                def status(s, d):
+                    self.uiq.put(UiEvent(kind="status", status=s, detail=d))
 
-                for idx, vid in enumerate(videos, start=1):
-                    if self.cancel_flag.is_set():
-                        results.append("Cancelled by user.")
-                        break
+                def progress(done, total, elapsed):
+                    self.uiq.put(UiEvent(kind="progress", current=done, total=total, elapsed_s=elapsed))
 
-                    elapsed = time.perf_counter() - batch_start
+                results = run_batch(
+                    videos=videos,
+                    whisper_model=WHISPER_MODEL,
+                    existing_srt_mode=existing_srt_mode,
+                    status=status,
+                    progress=progress,
+                )
 
-                    # 0/1 while working
-                    self.uiq.put(UiEvent(
-                        kind="progress",
-                        current=completed,
-                        total=total,
-                        elapsed_s=elapsed
-                    ))
-                    self.uiq.put(UiEvent(
-                        kind="status",
-                        status="Processing",
-                        detail=f"{vid.name}"
-                    ))
-
-                    # OPTIONAL: per-file timing
-                    file_start = time.perf_counter()
-
-                    ok, msg = process_one_video(
-                        vid, self.uiq, self.cancel_flag, translator_cache, whisper_cache, existing_srt_mode
-                    )
-
-                    file_elapsed = time.perf_counter() - file_start
-
-                    # OPTIONAL: include per-file time in summary
-                    tag = "OK" if ok else "WARN"
-                    low = msg.lower()
-                    if "skipped" in low or "no speech detected" in low:
+                # build summary
+                lines = []
+                for r in results[-25:]:
+                    tag = "OK" if r.ok else "WARN"
+                    low = r.message.lower()
+                    if "skipped" in low or "no speech" in low:
                         tag = "SKIP"
-                    results.append(f"{tag} ({file_elapsed:.1f}s): {msg}")
+                    lines.append(f"{tag} ({r.elapsed_s:.1f}s): {r.video}: {r.message}")
 
-                    # Mark completed AFTER finishing the file
-                    completed += 1
-                    elapsed = time.perf_counter() - batch_start
-
-                    self.uiq.put(UiEvent(
-                        kind="progress",
-                        current=completed,
-                        total=total,
-                        elapsed_s=elapsed
-                    ))
-
-                summary = "\n".join(results[-25:])
-                elapsed = time.perf_counter() - batch_start  # 2C
-                self.uiq.put(UiEvent(kind="done", summary=summary, elapsed_s=elapsed))
+                summary = "\n".join(lines)
+                elapsed = sum(r.elapsed_s for r in results)  # or track elapsed in progress already
+                self.uiq.put(UiEvent(kind="done", summary=summary, elapsed_s=(time.perf_counter() - batch_start)))
             except Exception as e:
                 self.uiq.put(UiEvent(kind="error", summary=str(e)))
 
@@ -295,7 +165,6 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self.poll_ui_events)
-
 
 class SetupFrame(ttk.Frame):
     def __init__(self, parent, controller: App):
@@ -380,7 +249,6 @@ class SetupFrame(ttk.Frame):
             return
         self.controller.start_work(vids, existing_srt_mode=self.existing_srt_mode.get())
 
-
 class ProgressFrame(ttk.Frame):
     def __init__(self, parent, controller: App):
         super().__init__(parent)
@@ -431,8 +299,6 @@ class ProgressFrame(ttk.Frame):
         else:
             self.time_var.set(f"Elapsed: {m}:{s:02d}")
 
-
-
     def set_status(self, status: str, detail: str):
         self.status_var.set(status)
         self.detail_var.set(detail)
@@ -441,7 +307,6 @@ class ProgressFrame(ttk.Frame):
         self.controller.cancel_flag.set()
         self.cancel_btn.state(["disabled"])
         self.set_status("Cancelling…", "Finishing current step and then stopping.")
-
 
 if __name__ == "__main__":
     App().mainloop()
