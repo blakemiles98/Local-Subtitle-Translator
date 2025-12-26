@@ -21,7 +21,6 @@ def transcribe_to_srt(
     if whisper_cache is None:
         whisper_cache = {}
 
-    # cache key includes model_name + device + compute_type
     key = (model_name, "cpu", "int8")
 
     model = whisper_cache.get(key)
@@ -29,7 +28,6 @@ def transcribe_to_srt(
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
         whisper_cache[key] = model
 
-    # beam_size: 1-2 faster, 5 better
     segments, info = model.transcribe(video_path, beam_size=2, vad_filter=True)
 
     detected_lang = info.language or "unknown"

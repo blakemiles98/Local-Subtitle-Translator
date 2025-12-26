@@ -162,7 +162,15 @@ class App(tk.Tk):
                     s = secs % 60
                     elapsed_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
-                    messagebox.showinfo("Summary", f"Total time: {elapsed_str}\n\n{ev.summary or 'Done.'}")
+                    lines = ev.summary.splitlines() if ev.summary else ["Done."]
+
+                    SummaryDialog(
+                        parent=self,
+                        title="Summary",
+                        elapsed_str=elapsed_str,
+                        lines=lines,
+                    )
+
                     self.show_frame("SetupFrame")
                 elif ev.kind == "error":
                     messagebox.showerror("Error", ev.summary or "Unknown error")
@@ -243,11 +251,9 @@ class SetupFrame(ttk.Frame):
         pass
 
     def on_start(self):
-        self.controller.settings = {
-            "mode": self.mode.get(),
-            "scan_subfolders": self.scan_subfolders.get(),
-            "existing_srt_mode": self.existing_srt_mode.get(),
-        }
+        self.controller.settings["mode"] = self.mode.get()
+        self.controller.settings["scan_subfolders"] = self.scan_subfolders.get()
+        self.controller.settings["existing_srt_mode"] = self.existing_srt_mode.get()
         save_settings(self.controller.settings)
         
         mode = self.mode.get()
@@ -328,6 +334,71 @@ class ProgressFrame(ttk.Frame):
         self.controller.cancel_flag.set()
         self.cancel_btn.state(["disabled"])
         self.set_status("Cancelling…", "Finishing current step and then stopping.")
+
+class SummaryDialog(tk.Toplevel):
+    def __init__(self, parent, title: str, elapsed_str: str, lines: list[str], dark_mode: bool):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("820x460")
+        self.transient(parent)
+        self.grab_set()
+
+        if dark_mode:
+            base_bg = "#1e1e1e"
+            base_fg = "#e6e6e6"
+        else:
+            base_bg = "white"
+            base_fg = "black"
+
+        ttk.Label(
+            self,
+            text=f"Total time: {elapsed_str}",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", padx=10, pady=(10, 6))
+
+        text = tk.Text(self, wrap="word", height=20, bg=base_bg, fg=base_fg, insertbackground=base_fg)
+        text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Background highlight styles
+        text.tag_configure(
+            "OK",
+            background="#2e7d32",   # green
+            foreground="white"
+        )
+        text.tag_configure(
+            "WARN",
+            background="#ed6c02",   # orange
+            foreground="white"
+        )
+        text.tag_configure(
+            "SKIP",
+            background="#1565c0",   # blue
+            foreground="white"
+        )
+        text.tag_configure("TEXT", foreground=base_fg, background=base_bg)
+
+        for line in lines:
+            if "|" in line:
+                status, rest = line.split("|", 1)
+                status = status.strip()
+                rest = rest.strip()
+            else:
+                status = "INFO"
+                rest = line
+
+            # Insert status badge
+            badge = f" {status} "
+            if status in ("OK", "WARN", "SKIP"):
+                text.insert("end", badge, status)
+            else:
+                text.insert("end", badge, "TEXT")
+
+            # Insert spacing + rest of line
+            text.insert("end", f"  {rest}\n", "TEXT")
+
+        text.config(state="disabled")
+
+        ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0, 10))
 
 if __name__ == "__main__":
     App().mainloop()
