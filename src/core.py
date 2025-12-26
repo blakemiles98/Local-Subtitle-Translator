@@ -53,7 +53,7 @@ def process_one_video(
     if final_srt_path.exists() and existing_srt_mode == "skip":
         if status:
             status("Skipped", f"Existing SRT found, skipping: {video_path.name}")
-        return Result(True, f"skipped (existing {final_srt_path.name})", video_path.name, time.perf_counter() - t0)
+        return Result(True, "skipped (srt already exists)", video_path.name, time.perf_counter() - t0)
 
     if status:
         status("Whisper", f"Transcribing: {video_path.name}")
@@ -66,7 +66,7 @@ def process_one_video(
     if not has_real_text(source_srt):
         if status:
             status("Skipped", f"No speech detected: {video_path.name}")
-        return Result(False, "no speech detected (no SRT created)", video_path.name, time.perf_counter() - t0)
+        return Result(False, "no srt created (no speech detected)", video_path.name, time.perf_counter() - t0)
 
     if detected_lang == "en":
         if status:

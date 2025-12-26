@@ -336,19 +336,12 @@ class ProgressFrame(ttk.Frame):
         self.set_status("Cancelling…", "Finishing current step and then stopping.")
 
 class SummaryDialog(tk.Toplevel):
-    def __init__(self, parent, title: str, elapsed_str: str, lines: list[str], dark_mode: bool):
+    def __init__(self, parent, title: str, elapsed_str: str, lines: list[str]):
         super().__init__(parent)
         self.title(title)
         self.geometry("820x460")
         self.transient(parent)
         self.grab_set()
-
-        if dark_mode:
-            base_bg = "#1e1e1e"
-            base_fg = "#e6e6e6"
-        else:
-            base_bg = "white"
-            base_fg = "black"
 
         ttk.Label(
             self,
@@ -356,7 +349,7 @@ class SummaryDialog(tk.Toplevel):
             font=("Segoe UI", 10, "bold")
         ).pack(anchor="w", padx=10, pady=(10, 6))
 
-        text = tk.Text(self, wrap="word", height=20, bg=base_bg, fg=base_fg, insertbackground=base_fg)
+        text = tk.Text(self, wrap="word", height=20, bg="white", fg="black")
         text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         # Background highlight styles
@@ -375,26 +368,32 @@ class SummaryDialog(tk.Toplevel):
             background="#1565c0",   # blue
             foreground="white"
         )
-        text.tag_configure("TEXT", foreground=base_fg, background=base_bg)
+        text.tag_configure("TEXT", foreground="black")
 
         for line in lines:
-            if "|" in line:
-                status, rest = line.split("|", 1)
-                status = status.strip()
-                rest = rest.strip()
+            if line.startswith("OK"):
+                status = "OK"
+                rest = line[2:].lstrip()
+            elif line.startswith("WARN"):
+                status = "WARN"
+                rest = line[4:].lstrip()
+            elif line.startswith("SKIP"):
+                status = "SKIP"
+                rest = line[4:].lstrip()
             else:
                 status = "INFO"
                 rest = line
 
-            # Insert status badge
-            badge = f" {status} "
-            if status in ("OK", "WARN", "SKIP"):
-                text.insert("end", badge, status)
-            else:
-                text.insert("end", badge, "TEXT")
+            text.insert("end", " ", "TEXT")
 
-            # Insert spacing + rest of line
-            text.insert("end", f"  {rest}\n", "TEXT")
+            if status in ("OK", "WARN", "SKIP"):
+                text.insert("end", status, status)
+            else:
+                text.insert("end", status, "TEXT")
+
+            text.insert("end", "  ", "TEXT")
+
+            text.insert("end", f"{rest}\n", "TEXT")
 
         text.config(state="disabled")
 
