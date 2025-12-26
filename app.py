@@ -68,18 +68,7 @@ class UiEvent:
 def is_effectively_english(detected_lang: str, probs: dict[str, float]) -> tuple[bool, str]:
     if detected_lang == "en":
         return True, "Detected language is English."
-
-    en_prob = probs.get("en", 0.0)
-    top_lang = max(probs, key=probs.get) if probs else detected_lang
-    top_prob = probs.get(top_lang, 0.0)
-
-    if en_prob >= EN_PROB_STRONG:
-        return True, f"English probability is high ({en_prob:.2f})."
-
-    if en_prob >= EN_PROB_SOFT and (top_prob - en_prob) <= TOP_GAP_SOFT:
-        return True, f"English probability is close to top ({en_prob:.2f} vs {top_prob:.2f})."
-
-    return False, f"Non-English likely (top={top_lang}:{top_prob:.2f}, en={en_prob:.2f})."
+    return False, f"Detected language is {detected_lang}."
 
 
 def has_real_text(srt_text: str) -> bool:
@@ -107,17 +96,12 @@ def process_one_video(video_path: Path, uiq: queue.Queue, cancel_flag: threading
     final_srt_path = out_dir / f"{base_name}.srt"
     fallback_source_srt_path = out_dir / f"{base_name}.source.srt"
 
-    if final_srt_path.exists():
-        if existing_srt_mode == "skip":
-            uiq.put(UiEvent(
-                kind="status",
-                status="Skipped",
-                detail=f"Existing SRT found, skipping: {video_path.name}"
-            ))
-            return True, f"{video_path.name}: skipped (existing {final_srt_path.name})"
+    if existing_srt_mode == "overwrite":
+        fallback_source_srt_path.unlink(missing_ok=True)
 
-        if existing_srt_mode == "overwrite":
-            fallback_source_srt_path.unlink(missing_ok=True)
+    if final_srt_path.exists() and existing_srt_mode == "skip":
+        uiq.put(UiEvent(kind="status", status="Skipped", detail=f"Existing SRT found, skipping: {video_path.name}"))
+        return True, f"{video_path.name}: skipped (existing {final_srt_path.name})"
 
     if cancel_flag.is_set():
         return False, f"{video_path.name}: cancelled"
@@ -262,7 +246,8 @@ class App(tk.Tk):
 
                     # OPTIONAL: include per-file time in summary
                     tag = "OK" if ok else "WARN"
-                    if "skipped" in msg.lower():
+                    low = msg.lower()
+                    if "skipped" in low or "no speech detected" in low:
                         tag = "SKIP"
                     results.append(f"{tag} ({file_elapsed:.1f}s): {msg}")
 
