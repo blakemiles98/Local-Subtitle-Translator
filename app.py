@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import traceback
 
 from src.core import collect_videos, process_one_video
 from src.core import run_batch
@@ -138,8 +139,11 @@ class App(tk.Tk):
                 summary = "\n".join(lines)
                 elapsed = sum(r.elapsed_s for r in results)
                 self.uiq.put(UiEvent(kind="done", summary=summary, elapsed_s=(time.perf_counter() - batch_start)))
-            except Exception as e:
-                self.uiq.put(UiEvent(kind="error", summary=str(e)))
+            except Exception:
+                tb = traceback.format_exc()
+                # also write to a file so you can read it even if the dialog truncates
+                Path("error.log").write_text(tb, encoding="utf-8")
+                self.uiq.put(UiEvent(kind="error", summary=tb))
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
         self.worker_thread.start()
