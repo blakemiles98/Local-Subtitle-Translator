@@ -31,6 +31,7 @@ class Result:
 
 StatusFn = Callable[[str, str], None]
 ProgressFn = Callable[[int, int, float, int, int], None]
+CancelFn = Callable[[], bool]
 
 def process_one_video(
     video_path: Path,
@@ -143,7 +144,7 @@ def run_batch(
     progress: ProgressFn | None = None,
     translator_cache: dict | None = None,
     whisper_cache: dict | None = None,
-    should_cancel: CancelFn | None = None,   # NEW
+    should_cancel: CancelFn | None = None,
 ) -> list[Result]:
     if translator_cache is None:
         translator_cache = {}

@@ -355,9 +355,10 @@ class ProgressFrame(ttk.Frame):
         self.set_progress(0, 1, 0.0, 0, 0)
         self.cancel_btn.state(["!disabled"])
 
-        self._batch_start_ts = time.perf_counter()
-        self._timer_running = True
-        self._tick()
+        if not self._timer_running:
+            self._batch_start_ts = time.perf_counter()
+            self._timer_running = True
+            self._tick()
 
     def set_total(self, total: int):
         self.bar["maximum"] = max(total, 1)
