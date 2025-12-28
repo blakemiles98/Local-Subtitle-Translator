@@ -30,7 +30,7 @@ class Result:
     elapsed_s: float
 
 StatusFn = Callable[[str, str], None]
-ProgressFn = Callable[[int, int, float], None]
+ProgressFn = Callable[[int, int, float, int, int], None]
 
 def process_one_video(
     video_path: Path,
@@ -48,8 +48,7 @@ def process_one_video(
     final_srt_path = out_dir / f"{base_name}.en.srt"
     fallback_source_srt_path = out_dir / f"{base_name}.source.srt"
 
-    # OPTIONAL GUARD: cap absurdly-long subtitle files so one giant video doesn't blow up translation
-    MAX_SUBS = 8000  # adjust as you like (e.g., 3000-12000)
+    MAX_SUBS = 8000
 
     if existing_srt_mode == "overwrite":
         fallback_source_srt_path.unlink(missing_ok=True)
@@ -78,14 +77,12 @@ def process_one_video(
             status("Skipped", f"No speech detected: {video_path.name}")
         return Result(False, "no srt created (no speech detected)", video_path.name, time.perf_counter() - t0)
 
-    # NEW: segment-count guard (prevents translation blowups on huge videos)
     try:
         subs = list(srt.parse(source_srt))
     except Exception:
         subs = []
 
     if len(subs) > MAX_SUBS:
-        # Keep the source so user still gets something, but skip translation to avoid crashes/time bombs
         fallback_source_srt_path.write_text(source_srt, encoding="utf-8")
         if status:
             status(
@@ -128,7 +125,6 @@ def process_one_video(
         translator = NllbTranslator(src_lang=src_nllb, tgt_lang="eng_Latn", device="cpu")
         translator_cache[src_nllb] = translator
 
-    # If you still use batch_size-based translation, keep it. (Token-aware batching is better long-term.)
     english_srt = translator.translate_srt(source_srt, max_tokens=400)
 
     if status:
@@ -161,9 +157,18 @@ def run_batch(
     total = len(videos)
     completed = 0
 
-    for vid in videos:
+    sizes = []
+    for v in videos:
+        try:
+            sizes.append(v.stat().st_size)
+        except Exception:
+            sizes.append(0)
+    total_bytes = sum(sizes)
+    done_bytes = 0
+
+    for i, vid in enumerate(videos):
         if progress:
-            progress(completed, total, time.perf_counter() - t0)
+            progress(completed, total, time.perf_counter() - t0, done_bytes, total_bytes)
 
         res = process_one_video(
             vid,
@@ -174,9 +179,11 @@ def run_batch(
             status=status,
         )
         results.append(res)
+
         completed += 1
+        done_bytes += sizes[i]
 
         if progress:
-            progress(completed, total, time.perf_counter() - t0)
+            progress(completed, total, time.perf_counter() - t0, done_bytes, total_bytes)
 
     return results

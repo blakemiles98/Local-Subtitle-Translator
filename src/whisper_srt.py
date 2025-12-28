@@ -43,7 +43,6 @@ def transcribe_to_srt(
             condition_on_previous_text=False,
         )
 
-    # Try direct first, then WAV fallback
     try:
         segments, info = _do_transcribe(video_path)
     except Exception as e1:
@@ -63,7 +62,6 @@ def transcribe_to_srt(
                 except Exception:
                     pass
 
-    # From here down, info is ALWAYS defined (or we already raised)
     detected_lang = (getattr(info, "language", None) or "unknown")
     probs = {detected_lang: float(getattr(info, "language_probability", 0.0) or 0.0)}
 
@@ -98,15 +96,14 @@ def _extract_audio_wav(video_path: str) -> str:
     tmp.close()
     wav_path = tmp.name
 
-    # -vn: no video, mono, 16k, PCM s16le
     cmd = [
         "ffmpeg",
         "-y",
-        "-v", "error",          # only show real errors
-        "-fflags", "+genpts",   # regenerate timestamps
+        "-v", "error",
+        "-fflags", "+genpts",
         "-err_detect", "ignore_err",
         "-i", video_path,
-        "-map", "0:a:0",        # pick first audio stream explicitly
+        "-map", "0:a:0",
         "-vn",
         "-ac", "1",
         "-ar", "16000",
@@ -122,5 +119,4 @@ def _extract_audio_wav(video_path: str) -> str:
     )
 
     if proc.returncode != 0:
-        # include stderr so you can see the actual ffmpeg reason
         raise RuntimeError(f"ffmpeg failed ({proc.returncode}).\n\n{proc.stderr}")

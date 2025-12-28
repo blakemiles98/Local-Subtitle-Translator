@@ -59,6 +59,8 @@ class UiEvent:
     total: int = 0
     summary: str = ""
     elapsed_s: float = 0.0
+    done_bytes: int = 0
+    total_bytes: int = 0
 
 class App(tk.Tk):
     def __init__(self):
@@ -115,8 +117,17 @@ class App(tk.Tk):
                 def status(s, d):
                     self.uiq.put(UiEvent(kind="status", status=s, detail=d))
 
-                def progress(done, total, elapsed):
-                    self.uiq.put(UiEvent(kind="progress", current=done, total=total, elapsed_s=elapsed))
+                def progress(done, total, elapsed, done_bytes, total_bytes):
+                    self.uiq.put(
+                        UiEvent(
+                            kind="progress",
+                            current=done,
+                            total=total,
+                            elapsed_s=elapsed,
+                            done_bytes=done_bytes,
+                            total_bytes=total_bytes,
+                        )
+                    )
 
                 results = run_batch(
                     videos=videos,
@@ -141,7 +152,6 @@ class App(tk.Tk):
                 self.uiq.put(UiEvent(kind="done", summary=summary, elapsed_s=(time.perf_counter() - batch_start)))
             except Exception:
                 tb = traceback.format_exc()
-                # also write to a file so you can read it even if the dialog truncates
                 Path("error.log").write_text(tb, encoding="utf-8")
                 self.uiq.put(UiEvent(kind="error", summary=tb))
 
@@ -157,9 +167,12 @@ class App(tk.Tk):
                     if "SetupFrame" in self.frames:
                         self.frames["SetupFrame"].set_status(ev.status, ev.detail)
                 elif ev.kind == "progress":
-                    self.frames["ProgressFrame"].set_progress(ev.current, ev.total, ev.elapsed_s)
+                    self.frames["ProgressFrame"].set_progress(
+                        ev.current, ev.total, ev.elapsed_s, ev.done_bytes, ev.total_bytes
+                    )
                 elif ev.kind == "done":
                     self.frames["ProgressFrame"].set_status("Done", "Finished.")
+                    self.frames["ProgressFrame"]._timer_running = False
                     secs = int(ev.elapsed_s)
                     h = secs // 3600
                     m = (secs % 3600) // 60
@@ -290,6 +303,16 @@ class ProgressFrame(ttk.Frame):
         self.detail_var = tk.StringVar(value="")
         self.count_var = tk.StringVar(value="")
 
+        self.eta_var = tk.StringVar(value="")
+        self._batch_start_ts: float | None = None
+        self._timer_running = False
+        self._current = 0
+        self._total = 1
+        self._done_bytes = 0
+        self._total_bytes = 0
+
+        ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
+
         ttk.Label(self, textvariable=self.status_var, font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(self, textvariable=self.detail_var, wraplength=600).pack(anchor="w", pady=(8, 0))
         ttk.Label(self, textvariable=self.count_var).pack(anchor="w", pady=(8, 0))
@@ -308,27 +331,27 @@ class ProgressFrame(ttk.Frame):
 
     def on_show(self):
         self.set_status("Starting…", "")
-        self.set_progress(0, 1)
+        self.set_progress(0, 1, 0.0, 0, 0)
         self.cancel_btn.state(["!disabled"])
+
+        self._batch_start_ts = time.perf_counter()
+        self._timer_running = True
+        self._tick()
 
     def set_total(self, total: int):
         self.bar["maximum"] = max(total, 1)
         self.bar["value"] = 0
         self.count_var.set(f"0 / {total}")
 
-    def set_progress(self, current: int, total: int, elapsed_s: float = 0.0):
-        self.bar["maximum"] = max(total, 1)
+    def set_progress(self, current: int, total: int, elapsed_s: float = 0.0, done_bytes: int = 0, total_bytes: int = 0):
+        self._current = current
+        self._total = max(total, 1)
+        self._done_bytes = max(done_bytes, 0)
+        self._total_bytes = max(total_bytes, 0)
+
+        self.bar["maximum"] = self._total
         self.bar["value"] = current
         self.count_var.set(f"{current} / {total}")
-
-        secs = int(elapsed_s)
-        h = secs // 3600
-        m = (secs % 3600) // 60
-        s = secs % 60
-        if h:
-            self.time_var.set(f"Elapsed: {h}:{m:02d}:{s:02d}")
-        else:
-            self.time_var.set(f"Elapsed: {m}:{s:02d}")
 
     def set_status(self, status: str, detail: str):
         self.status_var.set(status)
@@ -338,6 +361,46 @@ class ProgressFrame(ttk.Frame):
         self.controller.cancel_flag.set()
         self.cancel_btn.state(["disabled"])
         self.set_status("Cancelling…", "Finishing current step and then stopping.")
+        self._timer_running = False
+
+    def _tick(self):
+        if not self._timer_running:
+            return
+
+        now = time.perf_counter()
+        start = self._batch_start_ts or now
+        elapsed = max(0.0, now - start)
+
+        secs = int(elapsed)
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        s = secs % 60
+        elapsed_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+        self.time_var.set(f"Elapsed: {elapsed_str}")
+
+        eta_s = None
+
+        if self._total_bytes > 0 and self._done_bytes > 0 and elapsed > 0.5:
+            bytes_per_sec = self._done_bytes / elapsed
+            remaining_bytes = max(0, self._total_bytes - self._done_bytes)
+            if bytes_per_sec > 0:
+                eta_s = remaining_bytes / bytes_per_sec
+
+        if eta_s is None and self._current > 0 and self._total > self._current:
+            avg = elapsed / self._current
+            eta_s = avg * (self._total - self._current)
+
+        if eta_s is None:
+            self.eta_var.set("ETA: estimating…")
+        else:
+            eta_secs = int(max(0, eta_s))
+            eh = eta_secs // 3600
+            em = (eta_secs % 3600) // 60
+            es = eta_secs % 60
+            eta_str = f"{eh}:{em:02d}:{es:02d}" if eh else f"{em}:{es:02d}"
+            self.eta_var.set(f"ETA: {eta_str} remaining")
+
+        self.after(250, self._tick)
 
 class SummaryDialog(tk.Toplevel):
     def __init__(self, parent, title: str, elapsed_str: str, lines: list[str]):
@@ -356,7 +419,6 @@ class SummaryDialog(tk.Toplevel):
         text = tk.Text(self, wrap="word", height=20, bg="white", fg="black")
         text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        # Background highlight styles
         text.tag_configure(
             "OK",
             background="#2e7d32",   # green
