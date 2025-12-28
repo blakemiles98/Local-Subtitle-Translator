@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-import time
-import srt
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from src.whisper_srt import transcribe_to_srt
-from src.nllb_translate import NllbTranslator
+import srt
+
 from src.lang_map import WHISPER_TO_NLLB
+from src.nllb_translate import NllbTranslator
+from src.whisper_srt import transcribe_to_srt
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
 
@@ -53,6 +54,41 @@ def _update_meta(path: Path, patch: dict) -> dict:
     _atomic_write_json(path, doc)
     return doc
 
+def _did_work_from_result(r: Result) -> bool:
+    """
+    True when the file actually performed meaningful work (whisper/translate/write),
+    not when it was skipped due to cache/existing srt/translate-only mode.
+    """
+    msg = (r.message or "").lower()
+
+    if "skipped" in msg:
+        return False
+    if "no speech detected" in msg or "no-speech cached" in msg:
+        return False
+
+    # Treat these as real work outcomes:
+    if "translated to english" in msg:
+        return True
+    if "english srt written" in msg:
+        return True
+    if "wrote source fallback" in msg or "saved source only" in msg:
+        return True
+
+    # Default: if it wasn't a skip and it was ok, count it as work
+    return bool(r.ok)
+
+
+def _best_effort(fn: Callable[[], None], *, note: str = "") -> None:
+    """
+    Run fn() and ignore any exception.
+    Used for non-critical cache/cleanup operations (meta json, marker updates, optional unlinks).
+    """
+    try:
+        fn()
+    except Exception:
+        # Best-effort: failures intentionally ignored.
+        return
+
 def has_real_text(srt_text: str) -> bool:
     return any(ch.isalnum() for ch in srt_text)
 
@@ -70,9 +106,11 @@ class Result:
     video: str
     elapsed_s: float
 
+
 StatusFn = Callable[[str, str], None]
-ProgressFn = Callable[[int, int, float, int, int], None]
+ProgressFn = Callable[[int, int, float, int, int, bool], None]
 CancelFn = Callable[[], bool]
+
 
 def process_one_video(
     video_path: Path,
@@ -94,29 +132,26 @@ def process_one_video(
 
     MAX_SUBS = 8000
 
+    # ---- Skip rescans if we previously detected no speech and the file hasn't changed ----
     if existing_srt_mode == "skip":
-        try:
-            doc = _read_json(meta)
-            sys = doc.get("system") if isinstance(doc, dict) else None
-            no_speech = sys.get("no_speech") if isinstance(sys, dict) else None
-            if (
-                isinstance(no_speech, dict)
-                and no_speech.get("detected") is True
-                and no_speech.get("file_sig") == _file_sig(video_path)
-            ):
-                if status:
-                    status("Skipped", f"No-speech cached, skipping: {video_path.name}")
-                return Result(True, "skipped (no-speech cached)", video_path.name, time.perf_counter() - t0)
-        except Exception:
-            pass
+        doc = _read_json(meta)
+        sys = doc.get("system") if isinstance(doc, dict) else None
+        no_speech = sys.get("no_speech") if isinstance(sys, dict) else None
+        if (
+            isinstance(no_speech, dict)
+            and no_speech.get("detected") is True
+            and no_speech.get("file_sig") == _file_sig(video_path)
+        ):
+            if status:
+                status("Skipped", f"No-speech cached, skipping: {video_path.name}")
+            return Result(True, "skipped (no-speech cached)", video_path.name, time.perf_counter() - t0)
 
+    # ---- overwrite behavior ----
     if existing_srt_mode == "overwrite":
         fallback_source_srt_path.unlink(missing_ok=True)
-        try:
-            _update_meta(meta, {"system": {"no_speech": None}})
-        except Exception:
-            pass
+        _best_effort(lambda: _update_meta(meta, {"system": {"no_speech": None}}), note="clear no_speech")
 
+    # Existing .en.srt skip behavior
     if final_srt_path.exists() and existing_srt_mode == "skip":
         if status:
             status("Skipped", f"Existing SRT found, skipping: {video_path.name}")
@@ -135,9 +170,10 @@ def process_one_video(
             status("Skipped", f"Audio decode failed: {video_path.name}")
         return Result(False, f"audio decode failed ({e})", video_path.name, time.perf_counter() - t0)
 
+    # ---- No speech: write meta marker so we don't rescan next time ----
     if not has_real_text(source_srt):
-        try:
-            _update_meta(
+        _best_effort(
+            lambda: _update_meta(
                 meta,
                 {
                     "system": {
@@ -149,9 +185,9 @@ def process_one_video(
                         }
                     }
                 },
-            )
-        except Exception:
-            pass
+            ),
+            note="write no_speech marker",
+        )
 
         if status:
             status("Skipped", f"No speech detected: {video_path.name}")
@@ -179,7 +215,9 @@ def process_one_video(
 
     if detected_lang == "en":
         if english_output_mode == "non_english_only":
+            # translate-only mode: do not write .en.srt for English videos
             if existing_srt_mode == "overwrite":
+                # Remove stale English subtitle if overwrite was requested
                 final_srt_path.unlink(missing_ok=True)
 
             if status:
@@ -198,14 +236,14 @@ def process_one_video(
             status("Finalize", f"Writing English SRT: {video_path.name}")
         final_srt_path.write_text(source_srt, encoding="utf-8")
 
-        # clear/flip no_speech flag on success (optional, but prevents stale cache if file changed)
-        try:
-            _update_meta(
+        # Clear/flip no_speech flag on success (prevents stale cache if file changes)
+        _best_effort(
+            lambda: _update_meta(
                 meta,
                 {"system": {"no_speech": {"detected": False, "file_sig": _file_sig(video_path)}}},
-            )
-        except Exception:
-            pass
+            ),
+            note="clear no_speech on english success",
+        )
 
         return Result(True, "english srt written", video_path.name, time.perf_counter() - t0)
 
@@ -238,14 +276,13 @@ def process_one_video(
     final_srt_path.write_text(english_srt, encoding="utf-8")
     fallback_source_srt_path.unlink(missing_ok=True)
 
-    # clear/flip no_speech flag on success (optional)
-    try:
-        _update_meta(
+    _best_effort(
+        lambda: _update_meta(
             meta,
             {"system": {"no_speech": {"detected": False, "file_sig": _file_sig(video_path)}}},
-        )
-    except Exception:
-        pass
+        ),
+        note="clear no_speech on translate success",
+    )
 
     return Result(True, "translated to english", video_path.name, time.perf_counter() - t0)
 
@@ -272,7 +309,7 @@ def run_batch(
     t0 = time.perf_counter()
     completed = 0
 
-    durations = []
+    durations: list[float] = []
     total_videos = len(videos)
 
     fail_count = 0
@@ -307,6 +344,12 @@ def run_batch(
     total_work = sum(durations)
     done_work = 0.0
 
+    meta = _meta_path(v)
+    _best_effort(
+        lambda: _update_meta(meta, {"system": {"scan": {"last_scanned_utc": time.time()}}}),
+        note="update last_scanned",
+    )
+
     for i, vid in enumerate(videos):
         if should_cancel and should_cancel():
             if status:
@@ -314,7 +357,7 @@ def run_batch(
             break
 
         if progress:
-            progress(completed, total_videos, time.perf_counter() - t0, int(done_work), int(total_work))
+            progress(completed, total_videos, time.perf_counter() - t0, int(done_work), int(total_work), False)
 
         res = process_one_video(
             vid,
@@ -329,9 +372,10 @@ def run_batch(
 
         completed += 1
         done_work += durations[i]
+        did_work = _did_work_from_result(res)
 
         if progress:
-            progress(completed, total_videos, time.perf_counter() - t0, int(done_work), int(total_work))
+            progress(completed, total_videos, time.perf_counter() - t0, int(done_work), int(total_work), did_work)
 
         if should_cancel and should_cancel():
             if status:
@@ -340,17 +384,19 @@ def run_batch(
 
     return results
 
-def _media_duration_seconds_uncached(path: Path) -> float:
+
+def _ffprobe_json(path: Path) -> dict:
     """
-    Reads media duration using ffprobe. Returns 0.0 if unavailable.
+    Run ffprobe and return parsed JSON. Returns {} on failure.
     """
     try:
         p = subprocess.run(
             [
                 "ffprobe",
                 "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
                 str(path),
             ],
             capture_output=True,
@@ -359,34 +405,149 @@ def _media_duration_seconds_uncached(path: Path) -> float:
             timeout=60,
         )
         if p.returncode != 0:
+            return {}
+        return json.loads(p.stdout or "{}")
+    except Exception:
+        return {}
+
+
+def _to_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _to_int(x, default=0) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return int(default)
+
+
+def _parse_fps(rate: str) -> float:
+    try:
+        if not rate:
             return 0.0
-        return float(p.stdout.strip() or "0")
+        if "/" in rate:
+            a, b = rate.split("/", 1)
+            return float(a) / float(b)
+        return float(rate)
     except Exception:
         return 0.0
 
 
-def get_media_duration_seconds(path: Path) -> tuple[float, bool]:
+def _stream_language(stream: dict) -> str:
+    tags = stream.get("tags") or {}
+    lang = tags.get("language") or "und"
+    return (lang or "und").strip() or "und"
+
+
+def _stream_default(stream: dict) -> bool:
+    disp = stream.get("disposition") or {}
+    return bool(_to_int(disp.get("default", 0), 0))
+
+
+def _stream_forced(stream: dict) -> bool:
+    disp = stream.get("disposition") or {}
+    return bool(_to_int(disp.get("forced", 0), 0))
+
+
+def _parse_minimal_media_data(raw: dict, sig: dict) -> dict:
+    fmt = raw.get("format") or {}
+    streams = raw.get("streams") or []
+
+    container = (fmt.get("format_name") or "").strip()
+    duration_s = _to_float(fmt.get("duration"), 0.0)
+
+    primary_video = None
+    audio_tracks: list[dict] = []
+    sub_tracks: list[dict] = []
+
+    for st in streams:
+        st_type = st.get("codec_type")
+
+        if st_type == "video" and primary_video is None:
+            primary_video = {
+                "codec": (st.get("codec_name") or "").strip(),
+                "width": _to_int(st.get("width"), 0),
+                "height": _to_int(st.get("height"), 0),
+                "fps": _parse_fps(st.get("avg_frame_rate") or st.get("r_frame_rate") or ""),
+            }
+
+        elif st_type == "audio":
+            audio_tracks.append(
+                {
+                    "codec": (st.get("codec_name") or "").strip(),
+                    "channels": _to_int(st.get("channels"), 0),
+                    "language": _stream_language(st),
+                    "default": _stream_default(st),
+                }
+            )
+
+        elif st_type == "subtitle":
+            sub_tracks.append(
+                {
+                    "codec": (st.get("codec_name") or "").strip(),
+                    "language": _stream_language(st),
+                    "default": _stream_default(st),
+                    "forced": _stream_forced(st),
+                }
+            )
+
+    if primary_video is None:
+        primary_video = {"codec": "", "width": 0, "height": 0, "fps": 0.0}
+
+    return {
+        "file_sig": sig,
+        "duration_s": duration_s,
+        "container": container,
+        "video": primary_video,
+        "audio_tracks": audio_tracks,
+        "sub_tracks": sub_tracks,
+    }
+
+
+def get_media_data(path: Path) -> tuple[dict, bool]:
     """
-    Cached duration lookup using the per-video meta json.
-    Stores under: { "data": { "duration_s": <float>, "file_sig": {...} } }
-    Returns (duration_seconds, ok).
+    Cached minimal media data for your backend.
+
+    Stored in <video>.<ext>.meta.json under:
+      data: {
+        file_sig,
+        duration_s,
+        container,
+        video: {codec,width,height,fps},
+        audio_tracks: [{codec,channels,language,default}],
+        sub_tracks: [{codec,language,default,forced}]
+      }
+
+    Returns (data_dict, ok).
     """
     meta = _meta_path(path)
     sig = _file_sig(path)
 
     doc = _read_json(meta)
     data = doc.get("data") if isinstance(doc, dict) else None
-    if isinstance(data, dict):
-        if data.get("file_sig") == sig and isinstance(data.get("duration_s"), (int, float)):
-            dur = float(data["duration_s"])
-            return dur, (dur > 0.0)
+    if isinstance(data, dict) and data.get("file_sig") == sig:
+        return data, True
 
-    dur = _media_duration_seconds_uncached(path)
-    if dur > 0.0:
-        try:
-            _update_meta(meta, {"data": {"duration_s": dur, "file_sig": sig}})
-        except Exception:
-            pass
-        return dur, True
+    raw = _ffprobe_json(path)
+    if not raw:
+        return {}, False
 
-    return 0.0, False
+    parsed = _parse_minimal_media_data(raw, sig)
+
+    _best_effort(lambda: _update_meta(meta, {"data": parsed}), note="cache minimal media data")
+    return parsed, True
+
+
+def get_media_duration_seconds(path: Path) -> tuple[float, bool]:
+    """
+    Duration derived from cached minimal media data.
+    """
+    data, ok = get_media_data(path)
+    if not ok:
+        return 0.0, False
+    dur = float((data or {}).get("duration_s") or 0.0)
+    return dur, (dur > 0.0)

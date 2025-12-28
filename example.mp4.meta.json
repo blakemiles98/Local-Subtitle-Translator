@@ -2,21 +2,34 @@
   "system": {
     "no_speech": {
       "detected": true,
-      "whisper_model": "medium",
-      "created_utc": 1766800000.123,
-      "file_sig": { "size": 123456789, "mtime": 1766799000.0 }
+      "file_sig": {
+        "size": 123456789,
+        "mtime": 1766799000.0
+      }
     }
   },
   "data": {
     "duration_s": 1482.53,
-    "file_sig": { "size": 123456789, "mtime": 1766799000.0 }
+    "detected_language": "ru",
+    "language_probs": {
+      "ru": 0.92
+    },
+    "file_sig": {
+      "size": 123456789,
+      "mtime": 1766799000.0
+    }
   },
   "user": {
-    "tags": ["cozy", "anime"],
+    "tags": [
+      "cozy",
+      "anime"
+    ],
     "notes": "Great dub"
   },
   "meta": {
-    "genres": ["Drama"],
+    "genres": [
+      "Drama"
+    ],
     "release_date": "2019-10-03"
   }
 }

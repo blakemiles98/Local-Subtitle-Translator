@@ -62,6 +62,8 @@ class UiEvent:
     elapsed_s: float = 0.0
     done_work: int = 0
     total_work: int = 0
+    stats_line: str = ""
+    did_work: bool = False
 
 class App(tk.Tk):
     def __init__(self):
@@ -118,7 +120,7 @@ class App(tk.Tk):
                 def status(s, d):
                     self.uiq.put(UiEvent(kind="status", status=s, detail=d))
 
-                def progress(done, total, elapsed, done_work, total_work):
+                def progress(done, total, elapsed, done_work, total_work, did_work):
                     self.uiq.put(
                         UiEvent(
                             kind="progress",
@@ -127,6 +129,7 @@ class App(tk.Tk):
                             elapsed_s=elapsed,
                             done_work=done_work,
                             total_work=total_work,
+                            did_work=did_work,
                         )
                     )
 
@@ -144,13 +147,42 @@ class App(tk.Tk):
 
                 was_cancelled = self.cancel_flag.is_set()
 
+                translated = 0
+                created = 0
+                skipped = 0
+                warned = 0
+
                 lines = []
-                for r in results[-25:]:
-                    tag = "OK" if r.ok else "WARN"
-                    low = r.message.lower()
-                    if "skipped" in low or "no speech" in low:
+                for r in results:  # <-- all, no truncation
+                    msg_low = (r.message or "").lower()
+
+                    is_skipped = ("skipped" in msg_low) or ("no speech" in msg_low)
+                    is_translated = "translated to english" in msg_low
+                    is_created = ("english srt written" in msg_low) or is_translated
+
+                    if is_skipped:
+                        skipped += 1
                         tag = "SKIP"
+                    elif not r.ok:
+                        warned += 1
+                        tag = "WARN"
+                    else:
+                        tag = "OK"
+
+                    if is_translated:
+                        translated += 1
+                    if is_created:
+                        created += 1
+
                     lines.append(f"{tag} ({r.elapsed_s:.1f}s): {r.video}: {r.message}")
+
+                total_files = len(results)
+                stats_line = (
+                    f"Total files: {total_files}    "
+                    f"Files translated: {translated}    "
+                    f"Subtitles created: {created}    "
+                    f"Skipped: {skipped}"
+                )
 
                 summary = "\n".join(lines)
                 elapsed = sum(r.elapsed_s for r in results)
@@ -161,6 +193,7 @@ class App(tk.Tk):
                     UiEvent(
                         kind="done",
                         summary=summary,
+                        stats_line=stats_line,
                         elapsed_s=(time.perf_counter() - batch_start),
                         status=done_status,
                         detail=done_detail,
@@ -184,7 +217,7 @@ class App(tk.Tk):
                         self.frames["SetupFrame"].set_status(ev.status, ev.detail)
                 elif ev.kind == "progress":
                     self.frames["ProgressFrame"].set_progress(
-                        ev.current, ev.total, ev.elapsed_s, ev.done_work, ev.total_work
+                        ev.current, ev.total, ev.elapsed_s, ev.done_work, ev.total_work, ev.did_work
                     )
                 elif ev.kind == "done":
                     self.frames["ProgressFrame"].set_status(ev.status or "Done", ev.detail or "Finished.")
@@ -201,6 +234,7 @@ class App(tk.Tk):
                         parent=self,
                         title="Summary",
                         elapsed_str=elapsed_str,
+                        stats_line=ev.stats_line,
                         lines=lines,
                     )
 
@@ -374,6 +408,9 @@ class ProgressFrame(ttk.Frame):
         self.eta_var = tk.StringVar(value="ETA: estimating…")
         ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
 
+        self.duration_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.duration_var).pack(anchor="w", pady=(2, 0))
+
         self._last_eta_update_done = 0
         self._last_cp_work = 0
         self._last_cp_elapsed = 0.0
@@ -402,6 +439,7 @@ class ProgressFrame(ttk.Frame):
         elapsed_s: float = 0.0,
         done_work: int = 0,
         total_work: int = 0,
+        did_work: bool = False,
     ):
         self._current = current
         self._total = max(total, 1)
@@ -420,7 +458,18 @@ class ProgressFrame(ttk.Frame):
             self._wps_ewma = None
             return
 
-        if current == self._last_eta_update_done:
+        if current == self._last_eta_update_done and done_work == self._last_cp_work:
+            return
+        
+        if not did_work:
+            if self._total_work > 0:
+                done_str = self._fmt_hms(self._done_work)
+                left_str = self._fmt_hms(self._total_work - self._done_work)
+                total_str = self._fmt_hms(self._total_work)
+                self.duration_var.set(f"Duration: {done_str} done / {left_str} left (of {total_str})")
+            else:
+                done_str = self._fmt_hms(self._done_work)
+                self.duration_var.set(f"Duration: {done_str} done")
             return
 
         self._last_eta_update_done = current
@@ -468,6 +517,15 @@ class ProgressFrame(ttk.Frame):
         else:
             self._set_eta_seconds(eta_s)
 
+        if self._total_work > 0:
+            done_str = self._fmt_hms(self._done_work)
+            left_str = self._fmt_hms(self._total_work - self._done_work)
+            total_str = self._fmt_hms(self._total_work)
+            self.duration_var.set(f"Duration: {done_str} done / {left_str} left (of {total_str})")
+        else:
+            done_str = self._fmt_hms(self._done_work)
+            self.duration_var.set(f"Duration: {done_str} done")
+
     def _set_eta_seconds(self, eta_s: float):
         eta_secs = int(max(0, eta_s))
         eh = eta_secs // 3600
@@ -503,8 +561,15 @@ class ProgressFrame(ttk.Frame):
 
         self.after(250, self._tick)
 
+    def _fmt_hms(self, seconds: int) -> str:
+        seconds = max(0, int(seconds))
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
 class SummaryDialog(tk.Toplevel):
-    def __init__(self, parent, title: str, elapsed_str: str, lines: list[str]):
+    def __init__(self, parent, title: str, elapsed_str: str, stats_line: str, lines: list[str]):
         super().__init__(parent)
         self.title(title)
         self.geometry("820x460")
@@ -515,10 +580,25 @@ class SummaryDialog(tk.Toplevel):
             self,
             text=f"Total time: {elapsed_str}",
             font=("Segoe UI", 10, "bold")
-        ).pack(anchor="w", padx=10, pady=(10, 6))
+        ).pack(anchor="w", padx=10, pady=(10, 2))
 
-        text = tk.Text(self, wrap="word", height=20, bg="white", fg="black")
-        text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        if stats_line:
+            ttk.Label(
+                self,
+                text=stats_line,
+                font=("Segoe UI", 10, "bold")
+            ).pack(anchor="w", padx=10, pady=(0, 8))
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        text = tk.Text(body, wrap="word", height=20, bg="white", fg="black")
+        text.pack(side="left", fill="both", expand=True)
+
+        scroll = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        scroll.pack(side="right", fill="y")
+
+        text.configure(yscrollcommand=scroll.set)
 
         text.tag_configure(
             "OK",
