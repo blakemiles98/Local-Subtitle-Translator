@@ -27,6 +27,7 @@ DEFAULT_SETTINGS = {
     "mode": "single",
     "scan_subfolders": True,
     "existing_srt_mode": "skip",
+    "english_output_mode": "all",
 }
 
 def load_settings() -> dict:
@@ -59,8 +60,8 @@ class UiEvent:
     total: int = 0
     summary: str = ""
     elapsed_s: float = 0.0
-    done_bytes: int = 0
-    total_bytes: int = 0
+    done_work: int = 0
+    total_work: int = 0
 
 class App(tk.Tk):
     def __init__(self):
@@ -98,7 +99,7 @@ class App(tk.Tk):
         frame.tkraise()
         frame.on_show()
 
-    def start_work(self, videos: list[Path], existing_srt_mode: str):
+    def start_work(self, videos: list[Path], existing_srt_mode: str, english_output_mode: str):
         if not videos:
             messagebox.showwarning("No videos", "No videos selected.")
             return
@@ -117,15 +118,15 @@ class App(tk.Tk):
                 def status(s, d):
                     self.uiq.put(UiEvent(kind="status", status=s, detail=d))
 
-                def progress(done, total, elapsed, done_bytes, total_bytes):
+                def progress(done, total, elapsed, done_work, total_work):
                     self.uiq.put(
                         UiEvent(
                             kind="progress",
                             current=done,
                             total=total,
                             elapsed_s=elapsed,
-                            done_bytes=done_bytes,
-                            total_bytes=total_bytes,
+                            done_work=done_work,
+                            total_work=total_work,
                         )
                     )
 
@@ -133,11 +134,12 @@ class App(tk.Tk):
                     videos=videos,
                     whisper_model=WHISPER_MODEL,
                     existing_srt_mode=existing_srt_mode,
+                    english_output_mode=english_output_mode,
                     status=status,
                     progress=progress,
                     translator_cache=self.translator_cache,
                     whisper_cache=self.whisper_cache,
-                    should_cancel=self.cancel_flag.is_set,   # NEW
+                    should_cancel=self.cancel_flag.is_set,
                 )
 
                 was_cancelled = self.cancel_flag.is_set()
@@ -182,7 +184,7 @@ class App(tk.Tk):
                         self.frames["SetupFrame"].set_status(ev.status, ev.detail)
                 elif ev.kind == "progress":
                     self.frames["ProgressFrame"].set_progress(
-                        ev.current, ev.total, ev.elapsed_s, ev.done_bytes, ev.total_bytes
+                        ev.current, ev.total, ev.elapsed_s, ev.done_work, ev.total_work
                     )
                 elif ev.kind == "done":
                     self.frames["ProgressFrame"].set_status(ev.status or "Done", ev.detail or "Finished.")
@@ -230,6 +232,8 @@ class SetupFrame(ttk.Frame):
 
         settings = controller.settings
 
+        self.english_output_mode = tk.StringVar(value=settings.get("english_output_mode", "all"))
+
         self.setup_status_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.setup_status_var, wraplength=600).pack(anchor="w", pady=(10, 0))
 
@@ -266,6 +270,23 @@ class SetupFrame(ttk.Frame):
             value="overwrite",
         ).pack(anchor="w")
 
+        outopts = ttk.LabelFrame(self, text="English output", padding=10)
+        outopts.pack(fill="x", pady=(10, 0))
+
+        ttk.Radiobutton(
+            outopts,
+            text="Generate English subtitles for all videos",
+            variable=self.english_output_mode,
+            value="all",
+        ).pack(anchor="w")
+
+        ttk.Radiobutton(
+            outopts,
+            text="Only generate English subtitles for non-English videos (translate only)",
+            variable=self.english_output_mode,
+            value="non_english_only",
+        ).pack(anchor="w")
+
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(16, 0))
 
@@ -285,6 +306,7 @@ class SetupFrame(ttk.Frame):
         self.controller.settings["mode"] = self.mode.get()
         self.controller.settings["scan_subfolders"] = self.scan_subfolders.get()
         self.controller.settings["existing_srt_mode"] = self.existing_srt_mode.get()
+        self.controller.settings["english_output_mode"] = self.english_output_mode.get()
         save_settings(self.controller.settings)
         
         mode = self.mode.get()
@@ -296,7 +318,11 @@ class SetupFrame(ttk.Frame):
             )
             if not path:
                 return
-            self.controller.start_work([Path(path)], existing_srt_mode=self.existing_srt_mode.get())
+            self.controller.start_work(
+                [Path(path)],
+                existing_srt_mode=self.existing_srt_mode.get(),
+                english_output_mode=self.english_output_mode.get(),
+            )
             return
 
         folder = filedialog.askdirectory(title="Select a folder of videos")
@@ -306,7 +332,11 @@ class SetupFrame(ttk.Frame):
         if not vids:
             messagebox.showwarning("No videos found", "No videos found with the chosen options.")
             return
-        self.controller.start_work(vids, existing_srt_mode=self.existing_srt_mode.get())
+        self.controller.start_work(
+            vids,
+            existing_srt_mode=self.existing_srt_mode.get(),
+            english_output_mode=self.english_output_mode.get(),
+        )
 
 class ProgressFrame(ttk.Frame):
     def __init__(self, parent, controller: App):
@@ -321,8 +351,8 @@ class ProgressFrame(ttk.Frame):
         self._timer_running = False
         self._current = 0
         self._total = 1
-        self._done_bytes = 0
-        self._total_bytes = 0
+        self._done_work = 0
+        self._total_work = 0
 
 
         ttk.Label(self, textvariable=self.status_var, font=("Segoe UI", 12, "bold")).pack(anchor="w")
@@ -345,9 +375,9 @@ class ProgressFrame(ttk.Frame):
         ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
 
         self._last_eta_update_done = 0
-        self._last_cp_bytes = 0
+        self._last_cp_work = 0
         self._last_cp_elapsed = 0.0
-        self._bps_ewma: float | None = None
+        self._wps_ewma: float | None = None
         self._ewma_alpha = 0.30
 
     def on_show(self):
@@ -370,13 +400,13 @@ class ProgressFrame(ttk.Frame):
         current: int,
         total: int,
         elapsed_s: float = 0.0,
-        done_bytes: int = 0,
-        total_bytes: int = 0,
+        done_work: int = 0,
+        total_work: int = 0,
     ):
         self._current = current
         self._total = max(total, 1)
-        self._done_bytes = max(done_bytes, 0)
-        self._total_bytes = max(total_bytes, 0)
+        self._done_work = max(done_work, 0)
+        self._total_work = max(total_work, 0)
 
         self.bar["maximum"] = self._total
         self.bar["value"] = current
@@ -387,7 +417,7 @@ class ProgressFrame(ttk.Frame):
             self._last_eta_update_done = 0
             self._last_cp_bytes = 0
             self._last_cp_elapsed = 0.0
-            self._bps_ewma = None
+            self._wps_ewma = None
             return
 
         if current == self._last_eta_update_done:
@@ -401,7 +431,7 @@ class ProgressFrame(ttk.Frame):
             self._last_cp_elapsed = elapsed_s
             return
 
-        if self._total_bytes <= 0:
+        if self._total_work <= 0:
             if self._total > current and elapsed_s > 0.5:
                 avg = elapsed_s / current
                 eta_s = avg * (self._total - current)
@@ -410,29 +440,29 @@ class ProgressFrame(ttk.Frame):
                 self.eta_var.set("ETA: estimating…")
             return
 
-        delta_bytes = self._done_bytes - self._last_cp_bytes
+        delta_work = self._done_work - self._last_cp_bytes
         delta_time = elapsed_s - self._last_cp_elapsed
 
-        inst_bps = None
-        if delta_bytes > 0 and delta_time > 0.1:
-            inst_bps = delta_bytes / delta_time
-        elif self._done_bytes > 0 and elapsed_s > 0.5:
-            inst_bps = self._done_bytes / elapsed_s
+        inst_wps = None
+        if delta_work > 0 and delta_time > 0.1:
+            inst_wps = delta_work / delta_time
+        elif self._done_work > 0 and elapsed_s > 0.5:
+            inst_wps = self._done_work / elapsed_s
 
-        if inst_bps is None:
+        if inst_wps is None:
             self.eta_var.set("ETA: estimating…")
             return
 
-        if self._bps_ewma is None:
-            self._bps_ewma = inst_bps
+        if self._wps_ewma is None:
+            self._wps_ewma = inst_wps
         else:
-            self._bps_ewma = self._ewma_alpha * inst_bps + (1 - self._ewma_alpha) * self._bps_ewma
+            self._wps_ewma = self._ewma_alpha * inst_wps + (1 - self._ewma_alpha) * self._wps_ewma
 
         self._last_cp_bytes = self._done_bytes
         self._last_cp_elapsed = elapsed_s
 
-        remaining = max(0, self._total_bytes - self._done_bytes)
-        eta_s = remaining / self._bps_ewma if self._bps_ewma > 0 else None
+        remaining = max(0, self._total_work - self._done_work)
+        eta_s = remaining / self._wps_ewma if self._wps_ewma > 0 else None
         if eta_s is None:
             self.eta_var.set("ETA: estimating…")
         else:
