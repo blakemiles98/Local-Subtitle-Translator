@@ -395,8 +395,14 @@ class ProgressFrame(ttk.Frame):
 
         self._last_eta_update_done = current
 
+        if current < 2:
+            self.eta_var.set("ETA: estimating…")
+            self._last_cp_bytes = self._done_bytes
+            self._last_cp_elapsed = elapsed_s
+            return
+
         if self._total_bytes <= 0:
-            if current > 0 and self._total > current and elapsed_s > 0.5:
+            if self._total > current and elapsed_s > 0.5:
                 avg = elapsed_s / current
                 eta_s = avg * (self._total - current)
                 self._set_eta_seconds(eta_s)
@@ -407,24 +413,31 @@ class ProgressFrame(ttk.Frame):
         delta_bytes = self._done_bytes - self._last_cp_bytes
         delta_time = elapsed_s - self._last_cp_elapsed
 
+        inst_bps = None
+        if delta_bytes > 0 and delta_time > 0.1:
+            inst_bps = delta_bytes / delta_time
+        elif self._done_bytes > 0 and elapsed_s > 0.5:
+            inst_bps = self._done_bytes / elapsed_s
+
+        if inst_bps is None:
+            self.eta_var.set("ETA: estimating…")
+            return
+
+        if self._bps_ewma is None:
+            self._bps_ewma = inst_bps
+        else:
+            self._bps_ewma = self._ewma_alpha * inst_bps + (1 - self._ewma_alpha) * self._bps_ewma
+
         self._last_cp_bytes = self._done_bytes
         self._last_cp_elapsed = elapsed_s
 
-        if delta_bytes <= 0 or delta_time <= 0.1:
-            if self._done_bytes > 0 and elapsed_s > 0.5:
-                overall_bps = self._done_bytes / elapsed_s
-                self._bps_ewma = overall_bps if self._bps_ewma is None else (
-                    self._ewma_alpha * overall_bps + (1 - self._ewma_alpha) * self._bps_ewma
-                )
-            else:
-                self.eta_var.set("ETA: estimating…")
-                return
+        remaining = max(0, self._total_bytes - self._done_bytes)
+        eta_s = remaining / self._bps_ewma if self._bps_ewma > 0 else None
+        if eta_s is None:
+            self.eta_var.set("ETA: estimating…")
         else:
-            inst_bps = delta_bytes / delta_time
-            if self._bps_ewma is None:
-                self._bps_ewma = inst_bps
-            else:
-                self._bps_ewma = self._ewma_alpha * inst_bps + (1 - self._ewma_alpha) * self._bps_ewma
+            self._set_eta_seconds(eta_s)
+
 
         remaining = max(0, self._total_bytes - self._done_bytes)
         if self._bps_ewma and self._bps_ewma > 0:
