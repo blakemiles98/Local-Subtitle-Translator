@@ -341,8 +341,14 @@ class ProgressFrame(ttk.Frame):
         self.time_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.time_var).pack(anchor="w", pady=(6, 0))
 
-        self.eta_var = tk.StringVar(value="")
+        self.eta_var = tk.StringVar(value="ETA: estimating…")
         ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
+
+        self._last_eta_update_done = 0
+        self._last_cp_bytes = 0
+        self._last_cp_elapsed = 0.0
+        self._bps_ewma: float | None = None
+        self._ewma_alpha = 0.30
 
     def on_show(self):
         self.set_status("Starting…", "")
@@ -358,7 +364,14 @@ class ProgressFrame(ttk.Frame):
         self.bar["value"] = 0
         self.count_var.set(f"0 / {total}")
 
-    def set_progress(self, current: int, total: int, elapsed_s: float = 0.0, done_bytes: int = 0, total_bytes: int = 0):
+    def set_progress(
+        self,
+        current: int,
+        total: int,
+        elapsed_s: float = 0.0,
+        done_bytes: int = 0,
+        total_bytes: int = 0,
+    ):
         self._current = current
         self._total = max(total, 1)
         self._done_bytes = max(done_bytes, 0)
@@ -367,6 +380,65 @@ class ProgressFrame(ttk.Frame):
         self.bar["maximum"] = self._total
         self.bar["value"] = current
         self.count_var.set(f"{current} / {total}")
+
+        if current <= 0:
+            self.eta_var.set("ETA: estimating…")
+            self._last_eta_update_done = 0
+            self._last_cp_bytes = 0
+            self._last_cp_elapsed = 0.0
+            self._bps_ewma = None
+            return
+
+        if current == self._last_eta_update_done:
+            return
+
+        self._last_eta_update_done = current
+
+        if self._total_bytes <= 0:
+            if current > 0 and self._total > current and elapsed_s > 0.5:
+                avg = elapsed_s / current
+                eta_s = avg * (self._total - current)
+                self._set_eta_seconds(eta_s)
+            else:
+                self.eta_var.set("ETA: estimating…")
+            return
+
+        delta_bytes = self._done_bytes - self._last_cp_bytes
+        delta_time = elapsed_s - self._last_cp_elapsed
+
+        self._last_cp_bytes = self._done_bytes
+        self._last_cp_elapsed = elapsed_s
+
+        if delta_bytes <= 0 or delta_time <= 0.1:
+            if self._done_bytes > 0 and elapsed_s > 0.5:
+                overall_bps = self._done_bytes / elapsed_s
+                self._bps_ewma = overall_bps if self._bps_ewma is None else (
+                    self._ewma_alpha * overall_bps + (1 - self._ewma_alpha) * self._bps_ewma
+                )
+            else:
+                self.eta_var.set("ETA: estimating…")
+                return
+        else:
+            inst_bps = delta_bytes / delta_time
+            if self._bps_ewma is None:
+                self._bps_ewma = inst_bps
+            else:
+                self._bps_ewma = self._ewma_alpha * inst_bps + (1 - self._ewma_alpha) * self._bps_ewma
+
+        remaining = max(0, self._total_bytes - self._done_bytes)
+        if self._bps_ewma and self._bps_ewma > 0:
+            eta_s = remaining / self._bps_ewma
+            self._set_eta_seconds(eta_s)
+        else:
+            self.eta_var.set("ETA: estimating…")
+
+    def _set_eta_seconds(self, eta_s: float):
+        eta_secs = int(max(0, eta_s))
+        eh = eta_secs // 3600
+        em = (eta_secs % 3600) // 60
+        es = eta_secs % 60
+        eta_str = f"{eh}:{em:02d}:{es:02d}" if eh else f"{em}:{es:02d}"
+        self.eta_var.set(f"ETA: {eta_str} remaining")
 
     def set_status(self, status: str, detail: str):
         self.status_var.set(status)
@@ -392,28 +464,6 @@ class ProgressFrame(ttk.Frame):
         s = secs % 60
         elapsed_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
         self.time_var.set(f"Elapsed: {elapsed_str}")
-
-        eta_s = None
-
-        if self._total_bytes > 0 and self._done_bytes > 0 and elapsed > 0.5:
-            bytes_per_sec = self._done_bytes / elapsed
-            remaining_bytes = max(0, self._total_bytes - self._done_bytes)
-            if bytes_per_sec > 0:
-                eta_s = remaining_bytes / bytes_per_sec
-
-        if eta_s is None and self._current > 0 and self._total > self._current:
-            avg = elapsed / self._current
-            eta_s = avg * (self._total - self._current)
-
-        if eta_s is None:
-            self.eta_var.set("ETA: estimating…")
-        else:
-            eta_secs = int(max(0, eta_s))
-            eh = eta_secs // 3600
-            em = (eta_secs % 3600) // 60
-            es = eta_secs % 60
-            eta_str = f"{eh}:{em:02d}:{es:02d}" if eh else f"{em}:{es:02d}"
-            self.eta_var.set(f"ETA: {eta_str} remaining")
 
         self.after(250, self._tick)
 
