@@ -137,7 +137,10 @@ class App(tk.Tk):
                     progress=progress,
                     translator_cache=self.translator_cache,
                     whisper_cache=self.whisper_cache,
+                    should_cancel=self.cancel_flag.is_set,   # NEW
                 )
+
+                was_cancelled = self.cancel_flag.is_set()
 
                 lines = []
                 for r in results[-25:]:
@@ -149,7 +152,18 @@ class App(tk.Tk):
 
                 summary = "\n".join(lines)
                 elapsed = sum(r.elapsed_s for r in results)
-                self.uiq.put(UiEvent(kind="done", summary=summary, elapsed_s=(time.perf_counter() - batch_start)))
+                done_status = "Cancelled" if was_cancelled else "Done"
+                done_detail = "Stopped by user." if was_cancelled else "Finished."
+
+                self.uiq.put(
+                    UiEvent(
+                        kind="done",
+                        summary=summary,
+                        elapsed_s=(time.perf_counter() - batch_start),
+                        status=done_status,
+                        detail=done_detail,
+                    )
+                )
             except Exception:
                 tb = traceback.format_exc()
                 Path("error.log").write_text(tb, encoding="utf-8")
@@ -171,7 +185,7 @@ class App(tk.Tk):
                         ev.current, ev.total, ev.elapsed_s, ev.done_bytes, ev.total_bytes
                     )
                 elif ev.kind == "done":
-                    self.frames["ProgressFrame"].set_status("Done", "Finished.")
+                    self.frames["ProgressFrame"].set_status(ev.status or "Done", ev.detail or "Finished.")
                     self.frames["ProgressFrame"]._timer_running = False
                     secs = int(ev.elapsed_s)
                     h = secs // 3600
@@ -303,7 +317,6 @@ class ProgressFrame(ttk.Frame):
         self.detail_var = tk.StringVar(value="")
         self.count_var = tk.StringVar(value="")
 
-        self.eta_var = tk.StringVar(value="")
         self._batch_start_ts: float | None = None
         self._timer_running = False
         self._current = 0
@@ -311,7 +324,6 @@ class ProgressFrame(ttk.Frame):
         self._done_bytes = 0
         self._total_bytes = 0
 
-        ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
 
         ttk.Label(self, textvariable=self.status_var, font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(self, textvariable=self.detail_var, wraplength=600).pack(anchor="w", pady=(8, 0))
@@ -328,6 +340,9 @@ class ProgressFrame(ttk.Frame):
 
         self.time_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.time_var).pack(anchor="w", pady=(6, 0))
+
+        self.eta_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
 
     def on_show(self):
         self.set_status("Starting…", "")

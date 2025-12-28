@@ -134,8 +134,6 @@ def process_one_video(
 
     return Result(True, "translated to english", video_path.name, time.perf_counter() - t0)
 
-
-
 def run_batch(
     videos: list[Path],
     whisper_model: str,
@@ -145,6 +143,7 @@ def run_batch(
     progress: ProgressFn | None = None,
     translator_cache: dict | None = None,
     whisper_cache: dict | None = None,
+    should_cancel: CancelFn | None = None,   # NEW
 ) -> list[Result]:
     if translator_cache is None:
         translator_cache = {}
@@ -167,6 +166,11 @@ def run_batch(
     done_bytes = 0
 
     for i, vid in enumerate(videos):
+        if should_cancel and should_cancel():
+            if status:
+                status("Cancelled", "Stopping after current file.")
+            break
+
         if progress:
             progress(completed, total, time.perf_counter() - t0, done_bytes, total_bytes)
 
@@ -185,5 +189,10 @@ def run_batch(
 
         if progress:
             progress(completed, total, time.perf_counter() - t0, done_bytes, total_bytes)
+
+        if should_cancel and should_cancel():
+            if status:
+                status("Cancelled", "Stopping now.")
+            break
 
     return results
