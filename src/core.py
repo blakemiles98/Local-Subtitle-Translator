@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import srt
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -37,6 +38,7 @@ def process_one_video(
     video_path: Path,
     whisper_model: str,
     existing_srt_mode: str,
+    english_output_mode: str,
     translator_cache: dict,
     whisper_cache: dict,
     status: StatusFn | None = None,
@@ -99,6 +101,11 @@ def process_one_video(
         )
 
     if detected_lang == "en":
+        if english_output_mode == "non_english_only":
+            if status:
+                status("Skipped", f"English detected; not writing .en.srt (translate-only mode): {video_path.name}")
+            return Result(True, "skipped (english; translate-only mode)", video_path.name, time.perf_counter() - t0)
+
         if status:
             status("Finalize", f"Writing English SRT: {video_path.name}")
         final_srt_path.write_text(source_srt, encoding="utf-8")
@@ -139,6 +146,7 @@ def run_batch(
     videos: list[Path],
     whisper_model: str,
     existing_srt_mode: str,
+    english_output_mode: str = "all",
     recursive: bool = False,
     status: StatusFn | None = None,
     progress: ProgressFn | None = None,
@@ -157,14 +165,13 @@ def run_batch(
     total = len(videos)
     completed = 0
 
-    sizes = []
+    durations = []
     for v in videos:
-        try:
-            sizes.append(v.stat().st_size)
-        except Exception:
-            sizes.append(0)
-    total_bytes = sum(sizes)
-    done_bytes = 0
+        dur = _media_duration_seconds(v)
+        durations.append(dur)
+
+    total_work = sum(durations)  # seconds
+    done_work = 0.0
 
     for i, vid in enumerate(videos):
         if should_cancel and should_cancel():
@@ -173,12 +180,13 @@ def run_batch(
             break
 
         if progress:
-            progress(completed, total, time.perf_counter() - t0, done_bytes, total_bytes)
+            progress(completed, total, time.perf_counter() - t0, int(done_work), int(total_work))
 
         res = process_one_video(
             vid,
             whisper_model=whisper_model,
             existing_srt_mode=existing_srt_mode,
+            english_output_mode=english_output_mode,
             translator_cache=translator_cache,
             whisper_cache=whisper_cache,
             status=status,
@@ -186,10 +194,10 @@ def run_batch(
         results.append(res)
 
         completed += 1
-        done_bytes += sizes[i]
+        done_work += durations[i]
 
         if progress:
-            progress(completed, total, time.perf_counter() - t0, done_bytes, total_bytes)
+            progress(completed, total, time.perf_counter() - t0, int(done_work), int(total_work))
 
         if should_cancel and should_cancel():
             if status:
@@ -197,3 +205,23 @@ def run_batch(
             break
 
     return results
+
+def _media_duration_seconds(path: Path) -> float:
+    try:
+        p = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if p.returncode != 0:
+            return 0.0
+        return float(p.stdout.strip() or "0")
+    except Exception:
+        return 0.0

@@ -27,6 +27,7 @@ DEFAULT_SETTINGS = {
     "mode": "single",
     "scan_subfolders": True,
     "existing_srt_mode": "skip",
+    "english_output_mode": "all",
 }
 
 def load_settings() -> dict:
@@ -98,7 +99,7 @@ class App(tk.Tk):
         frame.tkraise()
         frame.on_show()
 
-    def start_work(self, videos: list[Path], existing_srt_mode: str):
+    def start_work(self, videos: list[Path], existing_srt_mode: str, english_output_mode: str):
         if not videos:
             messagebox.showwarning("No videos", "No videos selected.")
             return
@@ -133,11 +134,12 @@ class App(tk.Tk):
                     videos=videos,
                     whisper_model=WHISPER_MODEL,
                     existing_srt_mode=existing_srt_mode,
+                    english_output_mode=english_output_mode,
                     status=status,
                     progress=progress,
                     translator_cache=self.translator_cache,
                     whisper_cache=self.whisper_cache,
-                    should_cancel=self.cancel_flag.is_set,   # NEW
+                    should_cancel=self.cancel_flag.is_set,
                 )
 
                 was_cancelled = self.cancel_flag.is_set()
@@ -230,6 +232,8 @@ class SetupFrame(ttk.Frame):
 
         settings = controller.settings
 
+        self.english_output_mode = tk.StringVar(value=settings.get("english_output_mode", "all"))
+
         self.setup_status_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.setup_status_var, wraplength=600).pack(anchor="w", pady=(10, 0))
 
@@ -266,6 +270,23 @@ class SetupFrame(ttk.Frame):
             value="overwrite",
         ).pack(anchor="w")
 
+        outopts = ttk.LabelFrame(self, text="English output", padding=10)
+        outopts.pack(fill="x", pady=(10, 0))
+
+        ttk.Radiobutton(
+            outopts,
+            text="Generate English subtitles for all videos",
+            variable=self.english_output_mode,
+            value="all",
+        ).pack(anchor="w")
+
+        ttk.Radiobutton(
+            outopts,
+            text="Only generate English subtitles for non-English videos (translate only)",
+            variable=self.english_output_mode,
+            value="non_english_only",
+        ).pack(anchor="w")
+
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(16, 0))
 
@@ -285,6 +306,7 @@ class SetupFrame(ttk.Frame):
         self.controller.settings["mode"] = self.mode.get()
         self.controller.settings["scan_subfolders"] = self.scan_subfolders.get()
         self.controller.settings["existing_srt_mode"] = self.existing_srt_mode.get()
+        self.controller.settings["english_output_mode"] = self.english_output_mode.get()
         save_settings(self.controller.settings)
         
         mode = self.mode.get()
@@ -296,7 +318,11 @@ class SetupFrame(ttk.Frame):
             )
             if not path:
                 return
-            self.controller.start_work([Path(path)], existing_srt_mode=self.existing_srt_mode.get())
+            self.controller.start_work(
+                [Path(path)],
+                existing_srt_mode=self.existing_srt_mode.get(),
+                english_output_mode=self.english_output_mode.get(),
+            )
             return
 
         folder = filedialog.askdirectory(title="Select a folder of videos")
@@ -306,7 +332,11 @@ class SetupFrame(ttk.Frame):
         if not vids:
             messagebox.showwarning("No videos found", "No videos found with the chosen options.")
             return
-        self.controller.start_work(vids, existing_srt_mode=self.existing_srt_mode.get())
+        self.controller.start_work(
+            vids,
+            existing_srt_mode=self.existing_srt_mode.get(),
+            english_output_mode=self.english_output_mode.get(),
+        )
 
 class ProgressFrame(ttk.Frame):
     def __init__(self, parent, controller: App):
