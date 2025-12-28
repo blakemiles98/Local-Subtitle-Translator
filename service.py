@@ -41,7 +41,6 @@ def main():
             videos = collect_videos(inp, recursive=args.recursive)
 
     def status(s, d):
-        # caller can parse this if they want; good for systemd logs
         print(f"[{s}] {d}")
 
     def progress(done, total, elapsed):
@@ -62,7 +61,6 @@ def main():
         ]
         print(json.dumps(out, indent=2))
 
-    # exit code: nonzero if any failures
     if any(not r.ok for r in results):
         raise SystemExit(2)
 
