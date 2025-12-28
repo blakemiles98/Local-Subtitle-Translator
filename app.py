@@ -438,14 +438,6 @@ class ProgressFrame(ttk.Frame):
         else:
             self._set_eta_seconds(eta_s)
 
-
-        remaining = max(0, self._total_bytes - self._done_bytes)
-        if self._bps_ewma and self._bps_ewma > 0:
-            eta_s = remaining / self._bps_ewma
-            self._set_eta_seconds(eta_s)
-        else:
-            self.eta_var.set("ETA: estimating…")
-
     def _set_eta_seconds(self, eta_s: float):
         eta_secs = int(max(0, eta_s))
         eh = eta_secs // 3600
