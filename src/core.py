@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import srt
 
@@ -113,14 +113,59 @@ def _set_library_relpath(meta_path: Path, video_path: Path, library_root: Path |
 
 
 # ----------------------------
+# Fast skip helpers for huge libraries
+# ----------------------------
+def should_skip_fast(video_path: Path, existing_srt_mode: str) -> bool:
+    """
+    Fast skip without ffprobe/whisper.
+    Only checks 'skip' mode + existing .en.srt.
+    """
+    if existing_srt_mode != "skip":
+        return False
+    final_srt = video_path.parent / f"{video_path.stem}.en.srt"
+    return final_srt.exists()
+
+
+def filter_videos_for_run(videos: list[Path], existing_srt_mode: str) -> list[Path]:
+    """
+    For huge libraries, do a fast prefilter to remove obvious skips.
+    This massively reduces scan/probe work on 'resume' runs.
+    """
+    if existing_srt_mode != "skip":
+        return videos
+    return [v for v in videos if not should_skip_fast(v, existing_srt_mode)]
+
+
+def chunked(items: list[Path], size: int) -> Iterable[list[Path]]:
+    size = max(1, int(size))
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+# ----------------------------
 # Minimal media data (backend-friendly)
 # ----------------------------
 def _ffprobe_json(path: Path) -> dict:
+    """
+    IMPORTANT for Windows:
+    - Force UTF-8 decoding and replace invalid bytes to avoid UnicodeDecodeError.
+    """
     try:
         p = subprocess.run(
-            ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=60,
         )
@@ -397,16 +442,14 @@ def process_one_video(
             status("Skipped", f"Too many subtitle segments ({len(subs)}). Saved source only.")
         return Result(False, f"too many subtitle segments ({len(subs)}), saved source only", video_path.name, time.perf_counter() - t0)
 
-    translated = False
-    wrote_en = False
-
     if detected_lang == "en":
         if english_output_mode == "non_english_only":
             if existing_srt_mode == "overwrite":
                 final_srt_path.unlink(missing_ok=True)
+
             if status:
                 status("Skipped", f"English detected; not writing .en.srt (translate-only mode): {video_path.name}")
-            # still write subtitle provenance
+
             _best_effort(
                 lambda: _update_meta(
                     meta,
@@ -428,12 +471,12 @@ def process_one_video(
                     },
                 )
             )
+
             return Result(True, "skipped (english; translate-only mode)", video_path.name, time.perf_counter() - t0)
 
         if status:
             status("Finalize", f"Writing English SRT: {video_path.name}")
         final_srt_path.write_text(source_srt, encoding="utf-8")
-        wrote_en = True
 
         _best_effort(
             lambda: _update_meta(
@@ -464,6 +507,7 @@ def process_one_video(
         fallback_source_srt_path.write_text(source_srt, encoding="utf-8")
         if status:
             status("Translation skipped", f"Detected '{detected_lang}' but no mapping. Wrote source fallback.")
+
         _best_effort(
             lambda: _update_meta(
                 meta,
@@ -485,6 +529,7 @@ def process_one_video(
                 },
             )
         )
+
         return Result(False, f"no mapping for '{detected_lang}' (wrote source fallback)", video_path.name, time.perf_counter() - t0)
 
     if status:
@@ -498,12 +543,10 @@ def process_one_video(
         translator_cache[src_nllb] = translator
 
     english_srt = translator.translate_srt(source_srt, max_tokens=400)
-    translated = True
 
     if status:
         status("Finalize", f"Writing English SRT: {video_path.name}")
     final_srt_path.write_text(english_srt, encoding="utf-8")
-    wrote_en = True
     fallback_source_srt_path.unlink(missing_ok=True)
 
     _best_effort(
@@ -552,6 +595,7 @@ def run_batch(
         whisper_cache = {}
 
     results: list[Result] = []
+    videos = filter_videos_for_run(videos, existing_srt_mode)
 
     t0 = time.perf_counter()
     completed = 0
@@ -566,9 +610,7 @@ def run_batch(
                 status("Cancelled", "Stopped while scanning media info.")
             return results
 
-        # cache minimal data + duration (best-effort)
         get_media_data(v)
-
         dur, ok = get_media_duration_seconds(v)
         durations.append(dur if ok else 0.0)
 
@@ -576,7 +618,7 @@ def run_batch(
         _set_library_relpath(_meta_path(v), v, library_root)
         _ensure_media_id(_meta_path(v))
 
-        if status and (i == 1 or i % 10 == 0):
+        if status and (i == 1 or i % 50 == 0):
             status("Scanning", f"Reading media info ({i}/{total_videos})…")
 
     total_work = sum(durations)

@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from src.core import collect_videos, run_batch
+from src.core import collect_videos, run_batch, chunked, filter_videos_for_run
 
 
 def main() -> None:
@@ -26,6 +26,9 @@ def main() -> None:
         help="Write .en.srt for all videos, or only for non-English videos (translate-only mode)",
     )
 
+    p.add_argument("--chunk-size", type=int, default=750, help="Process in chunks for very large libraries")
+    p.add_argument("--chunk-threshold", type=int, default=1500, help="Only chunk when file count exceeds this")
+
     p.add_argument("--json", action="store_true", help="Print JSON results to stdout (for calling apps)")
     args = p.parse_args()
 
@@ -33,6 +36,7 @@ def main() -> None:
 
     if args.stdin_json:
         import sys
+
         raw = sys.stdin.read()
         paths = json.loads(raw)
         if not isinstance(paths, list):
@@ -52,15 +56,18 @@ def main() -> None:
     if not videos:
         raise SystemExit(1)
 
+    # fast prefilter for skip mode
+    videos2 = filter_videos_for_run(videos, args.existing)
+    if not videos2:
+        if args.json:
+            print("[]")
+        raise SystemExit(0)
+
     def status(s: str, d: str) -> None:
         print(f"[{s}] {d}")
 
-    # progress signature is now: (done, total, elapsed, done_work, total_work, did_work)
+    # progress signature: (done, total, elapsed, done_work, total_work, did_work)
     def progress(done: int, total: int, elapsed: float, done_work: int, total_work: int, did_work: bool) -> None:
-        # Keep it concise but useful in logs:
-        # - done/total files
-        # - done_work/total_work seconds (duration work)
-        # - did_work indicates whether ETA should learn from this completion
         print(
             f"[PROGRESS] {done}/{total} "
             f"elapsed={elapsed:.1f}s "
@@ -68,23 +75,46 @@ def main() -> None:
             f"did_work={did_work}"
         )
 
-    results = run_batch(
-        videos=videos,
-        whisper_model=args.model,
-        existing_srt_mode=args.existing,
-        english_output_mode=args.english_output,
-        status=status,
-        progress=progress,
-    )
+    results = []
+
+    # Chunk if huge
+    if len(videos2) > args.chunk_threshold:
+        status("Init", f"Large run detected ({len(videos2)} files). Processing in chunks of {args.chunk_size}…")
+
+        total_all = len(videos2)
+        global_done = 0
+
+        def chunk_progress(done: int, total: int, elapsed: float, done_work: int, total_work: int, did_work: bool) -> None:
+            # Map chunk done -> global done
+            progress(global_done + done, total_all, elapsed, done_work, total_work, did_work)
+
+        for part in chunked(videos2, args.chunk_size):
+            part_results = run_batch(
+                videos=part,
+                whisper_model=args.model,
+                existing_srt_mode=args.existing,
+                english_output_mode=args.english_output,
+                status=status,
+                progress=chunk_progress,
+            )
+            results.extend(part_results)
+            global_done += len(part)
+
+    else:
+        # Normal
+        results = run_batch(
+            videos=videos2,
+            whisper_model=args.model,
+            existing_srt_mode=args.existing,
+            english_output_mode=args.english_output,
+            status=status,
+            progress=progress,
+        )
 
     if args.json:
-        out = [
-            {"video": r.video, "ok": r.ok, "elapsed_s": r.elapsed_s, "message": r.message}
-            for r in results
-        ]
+        out = [{"video": r.video, "ok": r.ok, "elapsed_s": r.elapsed_s, "message": r.message} for r in results]
         print(json.dumps(out, indent=2))
 
-    # Non-zero exit if any failed
     if any(not r.ok for r in results):
         raise SystemExit(2)
 

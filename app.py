@@ -7,10 +7,10 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, messagebox
 
-from src.core import collect_videos, run_batch
+from src.core import collect_videos, run_batch, chunked, filter_videos_for_run
 from src.nllb_translate import warmup as nllb_warmup
 
-from src.ui.settings_store import load_settings, save_settings, DEFAULT_SETTINGS
+from src.ui.settings_store import load_settings, save_settings
 from src.ui.setup_frame import SetupFrame
 from src.ui.progress_frame import ProgressFrame
 from src.ui.summary_dialog import SummaryDialog
@@ -19,6 +19,10 @@ from src.ui.summary_dialog import SummaryDialog
 APP_VERSION = "1.0.0"  # bump whenever you release changes
 WHISPER_MODEL = "medium"
 NLLB_MODEL = "facebook/nllb-200-distilled-600M"
+
+# For big libraries: process in smaller groups for stability
+DEFAULT_CHUNK_SIZE = 750
+CHUNK_THRESHOLD = 1500  # if more than this, we chunk
 
 
 class App(tk.Tk):
@@ -71,27 +75,77 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
-                results = run_batch(
-                    videos=videos,
-                    whisper_model=WHISPER_MODEL,
-                    existing_srt_mode=existing_srt_mode,
-                    english_output_mode=english_output_mode,
-                    status=status,
-                    progress=progress,
-                    should_cancel=self.cancel_flag.is_set,
-                    library_root=library_root,
-                    tool_version=APP_VERSION,
-                    translator_model=NLLB_MODEL,
-                )
+                # Fast prefilter for skip mode (huge resume runs)
+                videos2 = filter_videos_for_run(videos, existing_srt_mode)
+                total_all = len(videos2)
 
-                # Build summary + totals
+                if total_all == 0:
+                    self.uiq.put(("done", "Total files: 0", ["SKIP: Nothing to do (all .en.srt already exist)."], 0.0))
+                    return
+
+                # Run either single batch or chunked batches
+                all_results = []
+                global_done = 0
+                start_perf = time.perf_counter()
+
+                # Wrap progress so UI shows global counts
+                def chunk_progress(done, total, elapsed, done_work, total_work, did_work):
+                    nonlocal global_done
+                    # Map chunk progress into global done count
+                    # 'done' counts within chunk, so shift by global_done at chunk start
+                    self.uiq.put(
+                        ("progress", global_done + done, total_all, time.perf_counter() - start_perf, done_work, total_work, did_work)
+                    )
+
+                if total_all > CHUNK_THRESHOLD:
+                    status("Init", f"Large run detected ({total_all} files). Processing in chunks of {DEFAULT_CHUNK_SIZE}…")
+
+                    for part in chunked(videos2, DEFAULT_CHUNK_SIZE):
+                        if self.cancel_flag.is_set():
+                            status("Cancelled", "Stopping now.")
+                            break
+
+                        # IMPORTANT: progress wrapper uses global_done offset
+                        results = run_batch(
+                            videos=part,
+                            whisper_model=WHISPER_MODEL,
+                            existing_srt_mode=existing_srt_mode,
+                            english_output_mode=english_output_mode,
+                            status=status,
+                            progress=chunk_progress,
+                            should_cancel=self.cancel_flag.is_set,
+                            library_root=library_root,
+                            tool_version=APP_VERSION,
+                            translator_model=NLLB_MODEL,
+                        )
+                        all_results.extend(results)
+                        global_done += len(part)
+
+                else:
+                    # Normal run
+                    all_results = run_batch(
+                        videos=videos2,
+                        whisper_model=WHISPER_MODEL,
+                        existing_srt_mode=existing_srt_mode,
+                        english_output_mode=english_output_mode,
+                        status=status,
+                        progress=progress,
+                        should_cancel=self.cancel_flag.is_set,
+                        library_root=library_root,
+                        tool_version=APP_VERSION,
+                        translator_model=NLLB_MODEL,
+                    )
+
+                # Build summary + totals (cap lines so UI doesn't melt on 15k files)
                 translated = 0
                 created = 0
                 skipped = 0
                 warned = 0
                 lines: list[str] = []
 
-                for r in results:
+                MAX_LINES = 5000
+
+                for r in all_results:
                     msg_low = (r.message or "").lower()
 
                     is_skipped = ("skipped" in msg_low) or ("no speech" in msg_low)
@@ -112,17 +166,22 @@ class App(tk.Tk):
                     if is_created:
                         created += 1
 
-                    lines.append(f"{tag} ({r.elapsed_s:.1f}s): {r.video}: {r.message}")
+                    if len(lines) < MAX_LINES:
+                        lines.append(f"{tag} ({r.elapsed_s:.1f}s): {r.video}: {r.message}")
+
+                if len(all_results) > MAX_LINES:
+                    lines.append(f"SKIP: Summary truncated to {MAX_LINES} lines (processed {len(all_results)} files).")
 
                 stats_line = (
-                    f"Total files: {len(results)}    "
+                    f"Total files: {len(all_results)}    "
                     f"Files translated: {translated}    "
                     f"Subtitles created: {created}    "
                     f"Skipped: {skipped}"
                 )
-                elapsed_s = self.frames["ProgressFrame"].elapsed_s()
+                elapsed_s = time.perf_counter() - start_perf
 
                 self.uiq.put(("done", stats_line, lines, elapsed_s))
+
             except Exception as e:
                 self.uiq.put(("error", str(e)))
 
