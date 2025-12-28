@@ -67,8 +67,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Local Subtitle Translator (Whisper + NLLB)")
-        self.geometry("640x360")
-        self.resizable(False, False)
+        self.geometry("640x480")
+        self.resizable(True, True)
 
         self.uiq: queue.Queue[UiEvent] = queue.Queue()
         self.cancel_flag = threading.Event()
