@@ -102,9 +102,20 @@ def process_one_video(
 
     if detected_lang == "en":
         if english_output_mode == "non_english_only":
+            if existing_srt_mode == "overwrite":
+                final_srt_path.unlink(missing_ok=True)
+
             if status:
-                status("Skipped", f"English detected; not writing .en.srt (translate-only mode): {video_path.name}")
-            return Result(True, "skipped (english; translate-only mode)", video_path.name, time.perf_counter() - t0)
+                status(
+                    "Skipped",
+                    f"English detected; not writing .en.srt (translate-only mode): {video_path.name}"
+                )
+            return Result(
+                True,
+                "skipped (english; translate-only mode)",
+                video_path.name,
+                time.perf_counter() - t0,
+            )
 
         if status:
             status("Finalize", f"Writing English SRT: {video_path.name}")
@@ -166,7 +177,20 @@ def run_batch(
     completed = 0
 
     durations = []
-    for v in videos:
+    total_videos = len(videos)
+
+    for i, v in enumerate(videos, 1):
+        if should_cancel and should_cancel():
+            if status:
+                status("Cancelled", "Stopped while scanning media durations.")
+            return results
+
+        if status and i % 5 == 0:
+            status(
+                "Scanning",
+                f"Reading media info ({i}/{total_videos})…"
+            )
+
         dur = _media_duration_seconds(v)
         durations.append(dur)
 
