@@ -415,7 +415,7 @@ class ProgressFrame(ttk.Frame):
         if current <= 0:
             self.eta_var.set("ETA: estimating…")
             self._last_eta_update_done = 0
-            self._last_cp_bytes = 0
+            self._last_cp_work = 0
             self._last_cp_elapsed = 0.0
             self._wps_ewma = None
             return
@@ -427,7 +427,7 @@ class ProgressFrame(ttk.Frame):
 
         if current < 2:
             self.eta_var.set("ETA: estimating…")
-            self._last_cp_bytes = self._done_bytes
+            self._last_cp_work = self._done_work
             self._last_cp_elapsed = elapsed_s
             return
 
@@ -440,7 +440,7 @@ class ProgressFrame(ttk.Frame):
                 self.eta_var.set("ETA: estimating…")
             return
 
-        delta_work = self._done_work - self._last_cp_bytes
+        delta_work = self._done_work - self._last_cp_work
         delta_time = elapsed_s - self._last_cp_elapsed
 
         inst_wps = None
@@ -458,7 +458,7 @@ class ProgressFrame(ttk.Frame):
         else:
             self._wps_ewma = self._ewma_alpha * inst_wps + (1 - self._ewma_alpha) * self._wps_ewma
 
-        self._last_cp_bytes = self._done_bytes
+        self._last_cp_work = self._done_work
         self._last_cp_elapsed = elapsed_s
 
         remaining = max(0, self._total_work - self._done_work)

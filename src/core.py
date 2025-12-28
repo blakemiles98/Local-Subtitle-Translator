@@ -356,6 +356,7 @@ def _media_duration_seconds_uncached(path: Path) -> float:
             capture_output=True,
             text=True,
             check=False,
+            timeout=60,
         )
         if p.returncode != 0:
             return 0.0
