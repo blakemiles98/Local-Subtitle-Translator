@@ -137,7 +137,10 @@ class App(tk.Tk):
                     progress=progress,
                     translator_cache=self.translator_cache,
                     whisper_cache=self.whisper_cache,
+                    should_cancel=self.cancel_flag.is_set,   # NEW
                 )
+
+                was_cancelled = self.cancel_flag.is_set()
 
                 lines = []
                 for r in results[-25:]:
@@ -149,7 +152,18 @@ class App(tk.Tk):
 
                 summary = "\n".join(lines)
                 elapsed = sum(r.elapsed_s for r in results)
-                self.uiq.put(UiEvent(kind="done", summary=summary, elapsed_s=(time.perf_counter() - batch_start)))
+                done_status = "Cancelled" if was_cancelled else "Done"
+                done_detail = "Stopped by user." if was_cancelled else "Finished."
+
+                self.uiq.put(
+                    UiEvent(
+                        kind="done",
+                        summary=summary,
+                        elapsed_s=(time.perf_counter() - batch_start),
+                        status=done_status,
+                        detail=done_detail,
+                    )
+                )
             except Exception:
                 tb = traceback.format_exc()
                 Path("error.log").write_text(tb, encoding="utf-8")
@@ -171,7 +185,7 @@ class App(tk.Tk):
                         ev.current, ev.total, ev.elapsed_s, ev.done_bytes, ev.total_bytes
                     )
                 elif ev.kind == "done":
-                    self.frames["ProgressFrame"].set_status("Done", "Finished.")
+                    self.frames["ProgressFrame"].set_status(ev.status or "Done", ev.detail or "Finished.")
                     self.frames["ProgressFrame"]._timer_running = False
                     secs = int(ev.elapsed_s)
                     h = secs // 3600
@@ -303,7 +317,6 @@ class ProgressFrame(ttk.Frame):
         self.detail_var = tk.StringVar(value="")
         self.count_var = tk.StringVar(value="")
 
-        self.eta_var = tk.StringVar(value="")
         self._batch_start_ts: float | None = None
         self._timer_running = False
         self._current = 0
@@ -311,7 +324,6 @@ class ProgressFrame(ttk.Frame):
         self._done_bytes = 0
         self._total_bytes = 0
 
-        ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
 
         ttk.Label(self, textvariable=self.status_var, font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(self, textvariable=self.detail_var, wraplength=600).pack(anchor="w", pady=(8, 0))
@@ -329,21 +341,38 @@ class ProgressFrame(ttk.Frame):
         self.time_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.time_var).pack(anchor="w", pady=(6, 0))
 
+        self.eta_var = tk.StringVar(value="ETA: estimating…")
+        ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
+
+        self._last_eta_update_done = 0
+        self._last_cp_bytes = 0
+        self._last_cp_elapsed = 0.0
+        self._bps_ewma: float | None = None
+        self._ewma_alpha = 0.30
+
     def on_show(self):
         self.set_status("Starting…", "")
         self.set_progress(0, 1, 0.0, 0, 0)
         self.cancel_btn.state(["!disabled"])
 
-        self._batch_start_ts = time.perf_counter()
-        self._timer_running = True
-        self._tick()
+        if not self._timer_running:
+            self._batch_start_ts = time.perf_counter()
+            self._timer_running = True
+            self._tick()
 
     def set_total(self, total: int):
         self.bar["maximum"] = max(total, 1)
         self.bar["value"] = 0
         self.count_var.set(f"0 / {total}")
 
-    def set_progress(self, current: int, total: int, elapsed_s: float = 0.0, done_bytes: int = 0, total_bytes: int = 0):
+    def set_progress(
+        self,
+        current: int,
+        total: int,
+        elapsed_s: float = 0.0,
+        done_bytes: int = 0,
+        total_bytes: int = 0,
+    ):
         self._current = current
         self._total = max(total, 1)
         self._done_bytes = max(done_bytes, 0)
@@ -352,6 +381,70 @@ class ProgressFrame(ttk.Frame):
         self.bar["maximum"] = self._total
         self.bar["value"] = current
         self.count_var.set(f"{current} / {total}")
+
+        if current <= 0:
+            self.eta_var.set("ETA: estimating…")
+            self._last_eta_update_done = 0
+            self._last_cp_bytes = 0
+            self._last_cp_elapsed = 0.0
+            self._bps_ewma = None
+            return
+
+        if current == self._last_eta_update_done:
+            return
+
+        self._last_eta_update_done = current
+
+        if current < 2:
+            self.eta_var.set("ETA: estimating…")
+            self._last_cp_bytes = self._done_bytes
+            self._last_cp_elapsed = elapsed_s
+            return
+
+        if self._total_bytes <= 0:
+            if self._total > current and elapsed_s > 0.5:
+                avg = elapsed_s / current
+                eta_s = avg * (self._total - current)
+                self._set_eta_seconds(eta_s)
+            else:
+                self.eta_var.set("ETA: estimating…")
+            return
+
+        delta_bytes = self._done_bytes - self._last_cp_bytes
+        delta_time = elapsed_s - self._last_cp_elapsed
+
+        inst_bps = None
+        if delta_bytes > 0 and delta_time > 0.1:
+            inst_bps = delta_bytes / delta_time
+        elif self._done_bytes > 0 and elapsed_s > 0.5:
+            inst_bps = self._done_bytes / elapsed_s
+
+        if inst_bps is None:
+            self.eta_var.set("ETA: estimating…")
+            return
+
+        if self._bps_ewma is None:
+            self._bps_ewma = inst_bps
+        else:
+            self._bps_ewma = self._ewma_alpha * inst_bps + (1 - self._ewma_alpha) * self._bps_ewma
+
+        self._last_cp_bytes = self._done_bytes
+        self._last_cp_elapsed = elapsed_s
+
+        remaining = max(0, self._total_bytes - self._done_bytes)
+        eta_s = remaining / self._bps_ewma if self._bps_ewma > 0 else None
+        if eta_s is None:
+            self.eta_var.set("ETA: estimating…")
+        else:
+            self._set_eta_seconds(eta_s)
+
+    def _set_eta_seconds(self, eta_s: float):
+        eta_secs = int(max(0, eta_s))
+        eh = eta_secs // 3600
+        em = (eta_secs % 3600) // 60
+        es = eta_secs % 60
+        eta_str = f"{eh}:{em:02d}:{es:02d}" if eh else f"{em}:{es:02d}"
+        self.eta_var.set(f"ETA: {eta_str} remaining")
 
     def set_status(self, status: str, detail: str):
         self.status_var.set(status)
@@ -377,28 +470,6 @@ class ProgressFrame(ttk.Frame):
         s = secs % 60
         elapsed_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
         self.time_var.set(f"Elapsed: {elapsed_str}")
-
-        eta_s = None
-
-        if self._total_bytes > 0 and self._done_bytes > 0 and elapsed > 0.5:
-            bytes_per_sec = self._done_bytes / elapsed
-            remaining_bytes = max(0, self._total_bytes - self._done_bytes)
-            if bytes_per_sec > 0:
-                eta_s = remaining_bytes / bytes_per_sec
-
-        if eta_s is None and self._current > 0 and self._total > self._current:
-            avg = elapsed / self._current
-            eta_s = avg * (self._total - self._current)
-
-        if eta_s is None:
-            self.eta_var.set("ETA: estimating…")
-        else:
-            eta_secs = int(max(0, eta_s))
-            eh = eta_secs // 3600
-            em = (eta_secs % 3600) // 60
-            es = eta_secs % 60
-            eta_str = f"{eh}:{em:02d}:{es:02d}" if eh else f"{em}:{es:02d}"
-            self.eta_var.set(f"ETA: {eta_str} remaining")
 
         self.after(250, self._tick)
 
