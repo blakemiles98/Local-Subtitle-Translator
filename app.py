@@ -60,8 +60,8 @@ class UiEvent:
     total: int = 0
     summary: str = ""
     elapsed_s: float = 0.0
-    done_bytes: int = 0
-    total_bytes: int = 0
+    done_work: int = 0
+    total_work: int = 0
 
 class App(tk.Tk):
     def __init__(self):
@@ -118,15 +118,15 @@ class App(tk.Tk):
                 def status(s, d):
                     self.uiq.put(UiEvent(kind="status", status=s, detail=d))
 
-                def progress(done, total, elapsed, done_bytes, total_bytes):
+                def progress(done, total, elapsed, done_work, total_work):
                     self.uiq.put(
                         UiEvent(
                             kind="progress",
                             current=done,
                             total=total,
                             elapsed_s=elapsed,
-                            done_bytes=done_bytes,
-                            total_bytes=total_bytes,
+                            done_work=done_work,
+                            total_work=total_work,
                         )
                     )
 
@@ -184,7 +184,7 @@ class App(tk.Tk):
                         self.frames["SetupFrame"].set_status(ev.status, ev.detail)
                 elif ev.kind == "progress":
                     self.frames["ProgressFrame"].set_progress(
-                        ev.current, ev.total, ev.elapsed_s, ev.done_bytes, ev.total_bytes
+                        ev.current, ev.total, ev.elapsed_s, ev.done_work, ev.total_work
                     )
                 elif ev.kind == "done":
                     self.frames["ProgressFrame"].set_status(ev.status or "Done", ev.detail or "Finished.")
@@ -351,8 +351,8 @@ class ProgressFrame(ttk.Frame):
         self._timer_running = False
         self._current = 0
         self._total = 1
-        self._done_bytes = 0
-        self._total_bytes = 0
+        self._done_work = 0
+        self._total_work = 0
 
 
         ttk.Label(self, textvariable=self.status_var, font=("Segoe UI", 12, "bold")).pack(anchor="w")
@@ -375,9 +375,9 @@ class ProgressFrame(ttk.Frame):
         ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
 
         self._last_eta_update_done = 0
-        self._last_cp_bytes = 0
+        self._last_cp_work = 0
         self._last_cp_elapsed = 0.0
-        self._bps_ewma: float | None = None
+        self._wps_ewma: float | None = None
         self._ewma_alpha = 0.30
 
     def on_show(self):
@@ -400,13 +400,13 @@ class ProgressFrame(ttk.Frame):
         current: int,
         total: int,
         elapsed_s: float = 0.0,
-        done_bytes: int = 0,
-        total_bytes: int = 0,
+        done_work: int = 0,
+        total_work: int = 0,
     ):
         self._current = current
         self._total = max(total, 1)
-        self._done_bytes = max(done_bytes, 0)
-        self._total_bytes = max(total_bytes, 0)
+        self._done_work = max(done_work, 0)
+        self._total_work = max(total_work, 0)
 
         self.bar["maximum"] = self._total
         self.bar["value"] = current
@@ -417,7 +417,7 @@ class ProgressFrame(ttk.Frame):
             self._last_eta_update_done = 0
             self._last_cp_bytes = 0
             self._last_cp_elapsed = 0.0
-            self._bps_ewma = None
+            self._wps_ewma = None
             return
 
         if current == self._last_eta_update_done:
@@ -431,7 +431,7 @@ class ProgressFrame(ttk.Frame):
             self._last_cp_elapsed = elapsed_s
             return
 
-        if self._total_bytes <= 0:
+        if self._total_work <= 0:
             if self._total > current and elapsed_s > 0.5:
                 avg = elapsed_s / current
                 eta_s = avg * (self._total - current)
@@ -440,29 +440,29 @@ class ProgressFrame(ttk.Frame):
                 self.eta_var.set("ETA: estimating…")
             return
 
-        delta_bytes = self._done_bytes - self._last_cp_bytes
+        delta_work = self._done_work - self._last_cp_bytes
         delta_time = elapsed_s - self._last_cp_elapsed
 
-        inst_bps = None
-        if delta_bytes > 0 and delta_time > 0.1:
-            inst_bps = delta_bytes / delta_time
-        elif self._done_bytes > 0 and elapsed_s > 0.5:
-            inst_bps = self._done_bytes / elapsed_s
+        inst_wps = None
+        if delta_work > 0 and delta_time > 0.1:
+            inst_wps = delta_work / delta_time
+        elif self._done_work > 0 and elapsed_s > 0.5:
+            inst_wps = self._done_work / elapsed_s
 
-        if inst_bps is None:
+        if inst_wps is None:
             self.eta_var.set("ETA: estimating…")
             return
 
-        if self._bps_ewma is None:
-            self._bps_ewma = inst_bps
+        if self._wps_ewma is None:
+            self._wps_ewma = inst_wps
         else:
-            self._bps_ewma = self._ewma_alpha * inst_bps + (1 - self._ewma_alpha) * self._bps_ewma
+            self._wps_ewma = self._ewma_alpha * inst_wps + (1 - self._ewma_alpha) * self._wps_ewma
 
         self._last_cp_bytes = self._done_bytes
         self._last_cp_elapsed = elapsed_s
 
-        remaining = max(0, self._total_bytes - self._done_bytes)
-        eta_s = remaining / self._bps_ewma if self._bps_ewma > 0 else None
+        remaining = max(0, self._total_work - self._done_work)
+        eta_s = remaining / self._wps_ewma if self._wps_ewma > 0 else None
         if eta_s is None:
             self.eta_var.set("ETA: estimating…")
         else:
