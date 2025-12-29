@@ -11,7 +11,9 @@ class ProgressFrame(ttk.Frame):
         self.controller = controller
 
         self._start_perf = time.perf_counter()
-        self._last_eta_update_done = -1
+
+        # ETA learning state
+        self._last_eta_learn_done = -1  # ONLY advances on did_work=True
         self._last_cp_work = 0
         self._last_cp_elapsed = 0.0
         self._wps_ewma: float | None = None
@@ -23,27 +25,47 @@ class ProgressFrame(ttk.Frame):
         self.eta_var = tk.StringVar(value="ETA: estimating…")
         self.duration_var = tk.StringVar(value="Duration: 0:00 done / 0:00 left (of 0:00)")
 
-        ttk.Label(self, text="Progress", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(10, 10))
+        # ---- GRID LAYOUT ----
+        self.columnconfigure(0, weight=1)
 
-        ttk.Label(self, textvariable=self.status_var, font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        ttk.Label(self, textvariable=self.detail_var).pack(anchor="w", pady=(2, 8))
-        ttk.Label(self, textvariable=self.count_var).pack(anchor="w")
+        title = ttk.Label(self, text="Progress", font=("Segoe UI", 16, "bold"))
+        title.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 10))
 
-        ttk.Label(self, textvariable=self.elapsed_var).pack(anchor="w", pady=(10, 0))
-        ttk.Label(self, textvariable=self.eta_var).pack(anchor="w", pady=(2, 0))
-        ttk.Label(self, textvariable=self.duration_var).pack(anchor="w", pady=(2, 0))
+        ttk.Label(self, textvariable=self.status_var, font=("Segoe UI", 12, "bold")).grid(
+            row=1, column=0, sticky="w", padx=12
+        )
+
+        detail_lbl = ttk.Label(self, textvariable=self.detail_var, wraplength=680, justify="left")
+        detail_lbl.grid(row=2, column=0, sticky="w", padx=12, pady=(2, 8))
+
+        ttk.Label(self, textvariable=self.count_var).grid(row=3, column=0, sticky="w", padx=12)
+        ttk.Label(self, textvariable=self.elapsed_var).grid(row=4, column=0, sticky="w", padx=12, pady=(10, 0))
+        ttk.Label(self, textvariable=self.eta_var).grid(row=5, column=0, sticky="w", padx=12, pady=(2, 0))
+        ttk.Label(self, textvariable=self.duration_var).grid(row=6, column=0, sticky="w", padx=12, pady=(2, 10))
 
         self.progress = ttk.Progressbar(self, mode="determinate")
-        self.progress.pack(fill="x", pady=(10, 10))
+        self.progress.grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 10))
 
         btns = ttk.Frame(self)
-        btns.pack(fill="x")
-        ttk.Button(btns, text="Cancel", command=self.controller.cancel_work).pack(side="left")
-        ttk.Button(btns, text="Back to Setup", command=lambda: controller.show_frame("SetupFrame")).pack(side="right")
+        btns.grid(row=8, column=0, sticky="ew", padx=12, pady=(0, 12))
+        btns.columnconfigure(0, weight=1)
+        btns.columnconfigure(1, weight=1)
+
+        ttk.Button(btns, text="Cancel", command=self.controller.cancel_work).grid(row=0, column=0, sticky="w")
+        ttk.Button(btns, text="Back to Setup", command=lambda: controller.show_frame("SetupFrame")).grid(
+            row=0, column=1, sticky="e"
+        )
+
+        def _on_resize(_evt):
+            w = max(300, self.winfo_width() - 40)
+            detail_lbl.configure(wraplength=w)
+
+        self.bind("<Configure>", _on_resize)
 
     def reset(self):
         self._start_perf = time.perf_counter()
-        self._last_eta_update_done = -1
+
+        self._last_eta_learn_done = -1
         self._last_cp_work = 0
         self._last_cp_elapsed = 0.0
         self._wps_ewma = None
@@ -71,7 +93,6 @@ class ProgressFrame(ttk.Frame):
         self.count_var.set(f"Files: {done}/{total}")
         self.elapsed_var.set(f"Elapsed: {self.fmt_hms(int(elapsed_s))}")
 
-        # duration line always updates
         if total_work > 0:
             remaining = max(0, total_work - done_work)
             self.duration_var.set(
@@ -80,19 +101,26 @@ class ProgressFrame(ttk.Frame):
         else:
             self.duration_var.set(f"Duration: {self.fmt_hms(done_work)} done")
 
-        # Only update ETA on real work completions (avoids resume skip poisoning)
-        if done == self._last_eta_update_done:
-            return
-        self._last_eta_update_done = done
-
-        if done <= 0 or total_work <= 0 or not did_work:
+        # ---- ETA LEARNING FIX ----
+        # Only "learn" (and advance checkpoint) on did_work=True events.
+        # This prevents the earlier did_work=False progress event from locking ETA into "waiting".
+        if not did_work:
+            # Show a helpful message, but don't block learning later.
             if done <= 0:
                 self.eta_var.set("ETA: estimating…")
             else:
                 self.eta_var.set("ETA: waiting for real processing…")
             return
 
-        # Throughput based on work completed since last checkpoint
+        # Avoid learning twice for same completed count
+        if done == self._last_eta_learn_done:
+            return
+        self._last_eta_learn_done = done
+
+        if done_work <= 0 or total_work <= 0:
+            self.eta_var.set("ETA: estimating…")
+            return
+
         delta_work = done_work - self._last_cp_work
         delta_t = elapsed_s - self._last_cp_elapsed
 
