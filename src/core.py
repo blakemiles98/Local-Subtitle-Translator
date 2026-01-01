@@ -330,16 +330,28 @@ CancelFn = Callable[[], bool]
 
 def _did_work_from_result(r: Result) -> bool:
     msg = (r.message or "").lower()
+
+    # Explicit skips should not teach ETA
     if "skipped" in msg:
         return False
-    if "no speech detected" in msg or "no-speech cached" in msg:
+
+    # No speech cached / no speech detected shouldn't teach ETA
+    if "no speech" in msg or "no-speech cached" in msg:
         return False
-    if "translated to english" in msg:
-        return True
+
+    # If we actually wrote anything, teach ETA
     if "english srt written" in msg:
+        return True
+    if "translated to english" in msg:
         return True
     if "wrote source fallback" in msg or "saved source only" in msg:
         return True
+
+    # Fallback: if it took non-trivial time, assume it was real work
+    # (covers message drift / unexpected wording)
+    if r.elapsed_s >= 2.0:
+        return True
+
     return bool(r.ok)
 
 
