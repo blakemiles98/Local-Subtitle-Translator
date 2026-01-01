@@ -13,7 +13,7 @@ class ProgressFrame(ttk.Frame):
         self._start_perf = time.perf_counter()
 
         # ETA learning state
-        self._last_eta_learn_done = -1  # ONLY advances on did_work=True
+        self._last_eta_learn_done = -1  # only advances on did_work=True
         self._last_cp_work = 0
         self._last_cp_elapsed = 0.0
         self._wps_ewma: float | None = None
@@ -101,18 +101,24 @@ class ProgressFrame(ttk.Frame):
         else:
             self.duration_var.set(f"Duration: {self.fmt_hms(done_work)} done")
 
-        # ---- ETA LEARNING FIX ----
-        # Only "learn" (and advance checkpoint) on did_work=True events.
-        # This prevents the earlier did_work=False progress event from locking ETA into "waiting".
-        if not did_work:
-            # Show a helpful message, but don't block learning later.
-            if done <= 0:
+        # ---- ETA behavior ----
+        # If we don't have an estimate yet:
+        if self._wps_ewma is None:
+            if done >= 0:
                 self.eta_var.set("ETA: estimating…")
-            else:
+            elif not did_work:
                 self.eta_var.set("ETA: waiting for real processing…")
+            # else: did_work=True will compute below
+        else:
+            # We DO have an estimate. Don't overwrite it just because the current event is did_work=False.
+            # (Skip/pre-file ticks shouldn't clobber ETA.)
+            if not did_work:
+                return
+
+        # Only learn on did_work=True
+        if not did_work:
             return
 
-        # Avoid learning twice for same completed count
         if done == self._last_eta_learn_done:
             return
         self._last_eta_learn_done = done
